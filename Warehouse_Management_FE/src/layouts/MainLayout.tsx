@@ -1,8 +1,69 @@
 import { Outlet, useLocation, useSearchParams } from 'react-router-dom';
+import { useEffect } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Sidebar } from './Sidebar';
+import { useAuthStore } from '@/store/authStore';
+import apiClient from '@/services/apiClient';
+import type { ApiResponse } from '@/types/api';
+
+interface RolePermissionApiItem {
+  module: string;
+  action: string;
+  is_active: boolean;
+}
+
+interface RoleDetailForAuth {
+  id: number;
+  permissions: RolePermissionApiItem[];
+}
+
+function unwrapRoleData(response: unknown): RoleDetailForAuth | null {
+  try {
+    if (!response || typeof response !== 'object' || !('data' in response)) return null;
+    const level1 = (response as { data: unknown }).data;
+    if (level1 && typeof level1 === 'object' && 'data' in level1) {
+      return (level1 as { data: RoleDetailForAuth }).data;
+    }
+    return (level1 as RoleDetailForAuth) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** On every app mount (incl. F5) refresh the logged-in user's permissions
+ *  from the server so sidebar reflects any role changes the admin made. */
+function useRefreshMyPermissions() {
+  const user = useAuthStore((s) => s.user);
+  const updateUser = useAuthStore((s) => s.updateUser);
+
+  useEffect(() => {
+    if (!user?.role_id) return;
+
+    let cancelled = false;
+    apiClient
+      .get<ApiResponse<RoleDetailForAuth>>(`/api/roles/${user.role_id}`)
+      .then((response) => {
+        if (cancelled) return;
+        const data = unwrapRoleData(response);
+        if (!data) return;
+        const freshPermissions = data.permissions
+          .filter((p) => p.is_active)
+          .map((p) => `${p.module}:${p.action}`.toLowerCase());
+        updateUser({ permissions: freshPermissions });
+      })
+      .catch(() => {
+        // Silent fail — keep cached permissions from localStorage
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.role_id]);
+}
 
 export function MainLayout() {
+  useRefreshMyPermissions();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -29,7 +90,7 @@ export function MainLayout() {
       <Sidebar />
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Top Header */}
-        <header className="h-16 shrink-0 flex items-center justify-between border-b border-gray-100 bg-white/70 px-8 backdrop-blur-sm">
+        <header className="h-12 shrink-0 flex items-center justify-between border-b border-gray-100 bg-white/70 px-5 backdrop-blur-sm">
           {/* Breadcrumb / Title area — để trống, từng page component tự render title */}
           <div />
 

@@ -7,12 +7,14 @@ import { StatePanel } from '@/components/StatePanel';
 import { usePermission } from '@/hooks/usePermission';
 import { useToast } from '@/hooks/use-toast';
 import {
+  useBinInventories,
   useUpdateZoneBinCapacity,
   useWarehouseCategoryOptions,
   useWarehouseHubs,
   useWarehouseProductOptions,
   useZoneBins,
 } from '../hooks/useWarehouses';
+import { BinInventoryPanel } from './BinInventoryPanel';
 import { binCapacityFormSchema, type BinCapacityFormData } from '../schemas/warehouseSchemas';
 import type { BinOccupancyLevel, Zone } from '../types/warehouseType';
 
@@ -144,6 +146,11 @@ export function ZoneDetail() {
   const [selectedRackCode, setSelectedRackCode] = useState<string>(rackList[0] ?? '');
   const viewMode: 'grid' = 'grid';
   const [selectedBinId, setSelectedBinId] = useState<string>('');
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
+  const [draftFilterCategoryId, setDraftFilterCategoryId] = useState('');
+  const [draftFilterProductId, setDraftFilterProductId] = useState('');
+  const [appliedFilterCategoryId, setAppliedFilterCategoryId] = useState('');
+  const [appliedFilterProductId, setAppliedFilterProductId] = useState('');
 
   useEffect(() => {
     if (filteredRackList.length === 0) return;
@@ -227,6 +234,9 @@ export function ZoneDetail() {
 
   const selectedBinTone = selectedBin ? getCapacityTone(selectedBin.occupancy) : null;
 
+  const hasActiveFilter = Boolean(appliedFilterCategoryId || appliedFilterProductId);
+  const activeFilterCount = Number(Boolean(appliedFilterCategoryId)) + Number(Boolean(appliedFilterProductId));
+
   useEffect(() => {
     if (selectedBin) {
       setSelectedBinId(selectedBin.id);
@@ -253,6 +263,16 @@ export function ZoneDetail() {
   const categoryId = watch('categoryId');
   const productId = watch('productId');
 
+  const locationId = selectedBin?.id.replace('loc-', '').trim() ?? '';
+  const { data: binInventories = [], isLoading: isInventoryLoading } = useBinInventories(locationId);
+  const inventoryCurrentLoad = binInventories.reduce((sum, row) => sum + row.available_quantity, 0);
+
+  useEffect(() => {
+    if (!isInventoryLoading) {
+      setValue('currentLoad', inventoryCurrentLoad);
+    }
+  }, [inventoryCurrentLoad, isInventoryLoading, setValue]);
+
   const allowedCategories = useMemo(() => {
     const allowedIdSet = new Set(zone?.allowedCategoryIds ?? []);
     return (categoryOptionsQuery.data ?? []).filter((item) => allowedIdSet.has(item.id));
@@ -263,16 +283,58 @@ export function ZoneDetail() {
   const productOptionsQuery = useWarehouseProductOptions(undefined, Boolean(zone));
   const isProductLoading = productOptionsQuery.isLoading || productOptionsQuery.isFetching;
   const isProductError = productOptionsQuery.isError;
+  const allProductOptions = productOptionsQuery.data ?? [];
+  const productCategoryMap = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    allProductOptions.forEach((product) => {
+      map.set(product.id, new Set(product.categoryIds));
+    });
+    return map;
+  }, [allProductOptions]);
+
+  const filterProducts = useMemo(() => {
+    if (!draftFilterCategoryId) {
+      return allProductOptions;
+    }
+
+    return allProductOptions.filter((product) => product.categoryIds.includes(draftFilterCategoryId));
+  }, [allProductOptions, draftFilterCategoryId]);
+
   const filteredProducts = useMemo(
     () => {
       if (!categoryId) {
         return [];
       }
 
-      return (productOptionsQuery.data ?? []).filter((product) => product.categoryIds.includes(categoryId));
+      return allProductOptions.filter((product) => product.categoryIds.includes(categoryId));
     },
-    [categoryId, productOptionsQuery.data],
+    [allProductOptions, categoryId],
   );
+
+  const doesBinMatchFilter = (bin: typeof bins[number]) => {
+    if (!hasActiveFilter) {
+      return true;
+    }
+
+    const matchedByCategory = !appliedFilterCategoryId
+      || bin.assignedCategoryId === appliedFilterCategoryId
+      || (bin.assignedProductId
+        ? (productCategoryMap.get(bin.assignedProductId)?.has(appliedFilterCategoryId) ?? false)
+        : false);
+
+    const matchedByProduct = !appliedFilterProductId || bin.assignedProductId === appliedFilterProductId;
+    return matchedByCategory && matchedByProduct;
+  };
+
+  const matchedBinIdSet = useMemo(() => {
+    return new Set(
+      bins
+        .filter((bin) => doesBinMatchFilter(bin))
+        .map((bin) => bin.id),
+    );
+  }, [appliedFilterCategoryId, appliedFilterProductId, bins, productCategoryMap]);
+
+  const hasMatchedBinsInZone = matchedBinIdSet.size > 0;
 
   useEffect(() => {
     if (!selectedBin) return;
@@ -296,8 +358,7 @@ export function ZoneDetail() {
   }, [clearErrors, productId]);
 
   const capacity = watch('capacity');
-  const currentLoad = watch('currentLoad');
-  const occupancy = capacity > 0 ? Math.round((currentLoad / capacity) * 100) : 0;
+  const occupancy = capacity > 0 ? Math.round((inventoryCurrentLoad / capacity) * 100) : 0;
 
   const onSubmit = async (payload: BinCapacityFormData) => {
     if (!zone || !selectedBin || !canManage) return;
@@ -309,6 +370,7 @@ export function ZoneDetail() {
         binId: selectedBin.id,
         payload,
       });
+      await binsQuery.refetch();
       toast({ title: 'Đã cập nhật sức chứa', description: `Bin ${selectedBin.code} đã được cấu hình.` });
     } catch (error) {
       toast({
@@ -327,6 +389,32 @@ export function ZoneDetail() {
     );
   }
 
+  const handleSelectBin = (binId: string) => {
+    setSelectedBinId(binId);
+    void binsQuery.refetch();
+  };
+
+  const handleToggleFilter = () => {
+    if (!isFilterOpen) {
+      setDraftFilterCategoryId(appliedFilterCategoryId);
+      setDraftFilterProductId(appliedFilterProductId);
+    }
+    setIsFilterOpen((current) => !current);
+  };
+
+  const handleApplyFilters = () => {
+    setAppliedFilterCategoryId(draftFilterCategoryId);
+    setAppliedFilterProductId(draftFilterProductId);
+    setIsFilterOpen(false);
+  };
+
+  const handleClearFilters = () => {
+    setDraftFilterCategoryId('');
+    setDraftFilterProductId('');
+    setAppliedFilterCategoryId('');
+    setAppliedFilterProductId('');
+  };
+
   if (hubsQuery.isError || binsQuery.isError || !zone) {
     return (
       <div className="flex h-full items-center justify-center p-8">
@@ -336,22 +424,18 @@ export function ZoneDetail() {
   }
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto bg-[#f8f9fb] p-4 sm:p-6 lg:p-8">
-      <div className="mb-6 flex flex-col justify-between gap-4 md:flex-row md:items-center">
-        <div>
+    <div className="flex h-full flex-col overflow-y-auto bg-[#f8f9fb] p-3 sm:p-4 lg:p-5">
+      <div className="mb-3 flex flex-col justify-between gap-3 md:flex-row md:items-center">
+        <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={() => navigate(-1)}
-            className="mb-2 inline-flex items-center gap-1 text-sm font-semibold text-blue-700 hover:text-blue-800"
+            aria-label="Back to Warehouse"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-blue-700 transition hover:bg-blue-50 hover:text-blue-800"
           >
             <span className="material-symbols-outlined text-[18px]">arrow_back</span>
-            Back to Warehouse
           </button>
-          <h1 className="text-lg sm:text-xl font-extrabold tracking-tight text-slate-900">Warehouse Zone {zone.code}</h1>
-          <p className="mt-1 flex items-center gap-2 text-slate-600">
-            <span className="material-symbols-outlined text-sm text-cyan-700">auto_awesome</span>
-            AI-Optimized Storage Map • Last updated {selectedBin?.lastUpdated ? 'just now' : 'N/A'}
-          </p>
+          <h1 className="text-lg font-extrabold tracking-tight text-slate-900 sm:text-xl">Warehouse Zone {zone.code}</h1>
         </div>
         <div className="flex flex-wrap gap-3">
           <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-4 py-2 shadow-sm">
@@ -366,36 +450,106 @@ export function ZoneDetail() {
               </span>
             ) : null}
           </div>
-          <button className="inline-flex items-center gap-2 rounded-xl bg-blue-700 px-5 py-2.5 text-sm font-bold text-white shadow-lg shadow-blue-700/20">
-            <span className="material-symbols-outlined text-[20px]">filter_list</span>
-            View Filters
-          </button>
         </div>
       </div>
 
       <div className="grid grid-cols-1 gap-8 xl:grid-cols-12">
         <div className="space-y-6 xl:col-span-8">
-          <div className="rounded-[2rem] bg-white p-6 shadow-sm sm:p-8">
-            <div className="mb-8 flex flex-wrap gap-6 border-b border-slate-200 pb-6">
-              {(['empty', 'low', 'partial', 'full', 'overloaded'] as BinOccupancyLevel[]).map((levelValue) => (
-                <div key={levelValue} className="flex items-center gap-2">
-                  <span className={`h-4 w-4 rounded ${getOccupancyColor(levelValue).split(' ')[0]}`}></span>
-                  <span className="text-sm text-slate-600">{getLegendLabel(levelValue)}</span>
-                </div>
-              ))}
-            </div>
-
-            <div className="mb-6 flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
+          <div className="rounded-2xl bg-white p-4 shadow-sm sm:p-5">
+            <div className="mb-4 flex flex-col justify-between gap-3 lg:flex-row lg:items-center">
               <div>
-                <p className="mb-2 text-sm font-semibold text-slate-600">Storage Rack</p>
-                <div className="mb-2 relative">
-                  <span className="material-symbols-outlined pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[16px] text-slate-400">search</span>
-                  <input
-                    value={rackBinSearch}
-                    onChange={(event) => setRackBinSearch(event.target.value)}
-                    placeholder="Tìm rack hoặc bin..."
-                    className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-8 pr-2 text-xs outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-                  />
+                <div className="mb-2 flex flex-wrap items-center gap-3">
+                  <p className="text-sm font-semibold text-slate-600">Storage Rack</p>
+                  <div className="flex flex-wrap gap-3">
+                    {(['empty', 'low', 'partial', 'full', 'overloaded'] as BinOccupancyLevel[]).map((levelValue) => (
+                      <div key={levelValue} className="flex items-center gap-1.5">
+                        <span className={`h-3.5 w-3.5 rounded ${getOccupancyColor(levelValue).split(' ')[0]}`}></span>
+                        <span className="text-xs text-slate-600">{getLegendLabel(levelValue)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <div className="relative flex-1">
+                    <span className="material-symbols-outlined pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[16px] text-slate-400">search</span>
+                    <input
+                      value={rackBinSearch}
+                      onChange={(event) => setRackBinSearch(event.target.value)}
+                      placeholder="Tìm rack hoặc bin..."
+                      className="h-10 w-full rounded-lg border border-slate-200 bg-white py-2 pl-8 pr-3 text-sm outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                    />
+                  </div>
+
+                  <div className="relative sm:shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleToggleFilter}
+                      className={`inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl px-4 text-sm font-bold text-white shadow-lg sm:w-auto ${hasActiveFilter ? 'bg-amber-500 shadow-amber-500/20 hover:bg-amber-600' : 'bg-blue-700 shadow-blue-700/20 hover:bg-blue-800'}`}
+                    >
+                      <span className="material-symbols-outlined text-[20px]">filter_list</span>
+                      View Filters
+                      {hasActiveFilter ? (
+                        <span className="rounded-full bg-white/90 px-2 py-0.5 text-xs font-black text-amber-700">{activeFilterCount}</span>
+                      ) : null}
+                    </button>
+
+                    {isFilterOpen ? (
+                      <div className="absolute right-0 z-20 mt-2 w-[320px] rounded-xl border border-slate-200 bg-white p-4 shadow-2xl">
+                        <div className="space-y-3">
+                          <label className="block text-xs font-semibold uppercase tracking-wide text-slate-600">
+                            Category
+                            <select
+                              value={draftFilterCategoryId}
+                              onChange={(event) => {
+                                const nextCategoryId = event.target.value;
+                                setDraftFilterCategoryId(nextCategoryId);
+                                setDraftFilterProductId('');
+                              }}
+                              className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-900 outline-none transition focus:border-blue-700 focus:ring-2 focus:ring-blue-100"
+                              disabled={isCategoryLoading || isCategoryError}
+                            >
+                              <option value="">All categories</option>
+                              {allowedCategories.map((item) => (
+                                <option key={item.id} value={item.id}>{item.name}</option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <label className="block text-xs font-semibold uppercase tracking-wide text-slate-600">
+                            Assigned Product
+                            <select
+                              value={draftFilterProductId}
+                              onChange={(event) => setDraftFilterProductId(event.target.value)}
+                              className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-900 outline-none transition focus:border-blue-700 focus:ring-2 focus:ring-blue-100"
+                              disabled={isProductLoading || isProductError || filterProducts.length === 0}
+                            >
+                              <option value="">All products</option>
+                              {filterProducts.map((item) => (
+                                <option key={item.id} value={item.id}>{item.sku} - {item.name}</option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <div className="flex justify-between gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={handleClearFilters}
+                              className="rounded-lg bg-slate-100 px-3 py-2 text-xs font-bold text-slate-700 transition hover:bg-slate-200"
+                            >
+                              Clear Filters
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleApplyFilters}
+                              className="rounded-lg bg-blue-700 px-3 py-2 text-xs font-bold text-white transition hover:bg-blue-800"
+                            >
+                              Apply
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {filteredRackList.map((item) => (
@@ -434,39 +588,52 @@ export function ZoneDetail() {
                 {filteredRackList.length === 0 ? (
                   <p className="mt-2 text-xs text-slate-500">Không có rack phù hợp với từ khóa tìm kiếm.</p>
                 ) : null}
-              </div>
-              <div className="inline-flex rounded-full bg-slate-100 p-1.5 shadow-inner">
-                <span className="rounded-full bg-white px-6 py-2 text-sm font-bold text-blue-700 shadow-sm">Grid View</span>
+                {hasActiveFilter && !hasMatchedBinsInZone ? (
+                  <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-800">
+                    No bins found matching the filter criteria.
+                  </p>
+                ) : null}
               </div>
             </div>
 
             {viewMode === 'grid' ? (
-              <motion.div className="space-y-6 pb-3" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}>
-                {levelGroups.map((group) => {
-                  return (
-                    <div key={group.levelCode} className="space-y-3">
-                      <p className="text-sm font-bold text-slate-900">LEVEL {group.levelCode}</p>
-                      <div className="overflow-x-auto">
-                        <div className="flex min-w-max gap-2 pb-1">
-                          {group.items.map(({ bin, coordinate }) => (
-                            <button
-                              key={bin.id}
-                              type="button"
-                              onClick={() => setSelectedBinId(bin.id)}
-                              className={`flex h-12 w-24 items-center justify-center rounded-lg px-1 text-[11px] font-bold leading-tight ring-offset-2 transition hover:ring-2 ${getOccupancyColor(bin.occupancyLevel)} ${selectedBin?.id === bin.id ? 'ring-2 ring-blue-700' : ''}`}
-                              title={`Bin ${coordinate.binCode}`}
-                            >
-                              {coordinate.binCode}
-                            </button>
-                          ))}
+              <motion.div className="pb-2" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}>
+                <div className="h-[calc(100vh-22rem)] min-h-104 max-h-[70vh] space-y-4 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50/40 p-2.5 pr-2 sm:p-3">
+                  {levelGroups.map((group) => {
+                    return (
+                      <div key={group.levelCode} className="space-y-2">
+                        <p className="text-center text-xs font-bold text-slate-900">LEVEL {group.levelCode}</p>
+                        <div className="overflow-x-auto">
+                          <div className="mx-auto flex w-max min-w-full justify-center gap-2 pb-1">
+                            {group.items.map(({ bin, coordinate }) => (
+                              (() => {
+                                const matched = matchedBinIdSet.has(bin.id);
+                                const isSelected = selectedBin?.id === bin.id;
+                                const dimClass = hasActiveFilter && !matched
+                                  ? (isSelected ? 'opacity-70 grayscale' : 'opacity-35 grayscale')
+                                  : '';
+                                return (
+                                  <button
+                                    key={bin.id}
+                                    type="button"
+                                    onClick={() => handleSelectBin(bin.id)}
+                                    className={`flex h-10 w-20 items-center justify-center rounded-lg px-1 text-[11px] font-bold leading-tight ring-offset-2 transition hover:ring-2 ${getOccupancyColor(bin.occupancyLevel)} ${dimClass} ${isSelected ? 'ring-2 ring-blue-700' : ''}`}
+                                    title={`Bin ${coordinate.binCode}`}
+                                  >
+                                    {coordinate.binCode}
+                                  </button>
+                                );
+                              })()
+                            ))}
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  );
-                })}
-                {levelGroups.length === 0 ? (
-                  <StatePanel title="Không có ô phù hợp" description="Thử thay đổi bộ lọc rack/bin để xem dữ liệu phù hợp." icon="search" />
-                ) : null}
+                    );
+                  })}
+                  {levelGroups.length === 0 ? (
+                    <StatePanel title="Không có ô phù hợp" description="Thử thay đổi bộ lọc rack/bin để xem dữ liệu phù hợp." icon="search" />
+                  ) : null}
+                </div>
               </motion.div>
             ) : (
               <div className="max-h-105 space-y-2 overflow-y-auto pr-1">
@@ -474,7 +641,7 @@ export function ZoneDetail() {
                   <button
                     key={bin.id}
                     type="button"
-                    onClick={() => setSelectedBinId(bin.id)}
+                    onClick={() => handleSelectBin(bin.id)}
                     className={`w-full rounded-lg border-2 p-3 text-left transition ${selectedBin?.id === bin.id ? 'border-blue-700 bg-blue-50' : 'border-slate-200 hover:border-slate-300'}`}
                   >
                     <div className="flex items-center justify-between">
@@ -490,21 +657,16 @@ export function ZoneDetail() {
             )}
           </div>
 
-          <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div className="relative overflow-hidden rounded-3xl border border-cyan-300 bg-cyan-100 p-6">
-              <span className="mb-4 inline-block rounded-full bg-cyan-300 px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-cyan-900">AI Optimization</span>
-              <h3 className="mb-2 text-xs font-bold text-slate-900">Space Consolidation</h3>
-              <p className="text-sm leading-relaxed text-slate-700">System recommends moving items from Row A to Row B to free up 12% space for upcoming high-velocity shipments.</p>
-            </div>
-            <div className="relative overflow-hidden rounded-3xl border border-red-300 bg-red-100 p-6">
-              <span className="mb-4 inline-block rounded-full bg-red-300 px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-red-900">Urgent Attention</span>
-              <h3 className="mb-2 text-xs font-bold text-slate-900">Critical Congestion</h3>
-              <p className="text-sm leading-relaxed text-slate-700">Bin {selectedBin?.code ?? 'N/A'} exceeds capacity threshold and requires reallocation workflow.</p>
-            </div>
-          </div>
         </div>
 
         <div className="space-y-6 xl:col-span-4">
+          {selectedBin && locationId && (
+            <BinInventoryPanel
+              locationId={locationId}
+              warehouseId={warehouseId}
+              zoneId={zone.id}
+            />
+          )}
           <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
             <div className="mb-6 flex items-center justify-between">
               <div>
@@ -539,10 +701,23 @@ export function ZoneDetail() {
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
-                  <Field label="Capacity" error={errors.capacity?.message}><input type="number" {...register('capacity', { valueAsNumber: true })} disabled={!canManage || updateBinMutation.isPending} className={inputClass(!!errors.capacity)} /></Field>
-                  <Field label="Current Load" error={errors.currentLoad?.message}><input type="number" {...register('currentLoad', { valueAsNumber: true })} disabled={!canManage || updateBinMutation.isPending} className={inputClass(!!errors.currentLoad)} /></Field>
-                  <Field label="Items" error={errors.items?.message}><input type="number" {...register('items', { valueAsNumber: true })} disabled={!canManage || updateBinMutation.isPending} className={inputClass(!!errors.items)} /></Field>
-                  <Field label="Product Count" error={errors.productCount?.message}><input type="number" {...register('productCount', { valueAsNumber: true })} disabled={!canManage || updateBinMutation.isPending} className={inputClass(!!errors.productCount)} /></Field>
+                  <input type="hidden" {...register('items', { valueAsNumber: true })} />
+                  <input type="hidden" {...register('productCount', { valueAsNumber: true })} />
+                  <input type="hidden" {...register('currentLoad', { valueAsNumber: true })} />
+                  <Field label="Capacity" error={errors.capacity?.message}><input type="number" min={1} step={1} {...register('capacity', { valueAsNumber: true })} disabled={!canManage || updateBinMutation.isPending} className={inputClass(!!errors.capacity)} /></Field>
+                  <div className="space-y-1.5">
+                    <span className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                      Current Load
+                    </span>
+                    <div className={`${inputClass(false)} flex items-center justify-between bg-slate-50 cursor-not-allowed`}>
+                      {isInventoryLoading
+                        ? <span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-slate-500" />
+                        : <span className="text-slate-500">{inventoryCurrentLoad}</span>
+                      }
+                      <span className="material-symbols-outlined text-[13px] text-slate-300">lock</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400">Từ API tồn kho</p>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 gap-3">
@@ -603,19 +778,20 @@ export function ZoneDetail() {
                   <div className="h-2 overflow-hidden rounded-full bg-slate-200">
                     <div className={`h-full ${occupancy > 100 ? 'bg-red-600' : 'bg-blue-700'}`} style={{ width: `${Math.min(100, Math.max(0, occupancy))}%` }}></div>
                   </div>
-                  <div className="mt-3 flex gap-2">
-                    <button type="button" onClick={() => setValue('currentLoad', Math.max(0, currentLoad - 10))} disabled={!canManage || updateBinMutation.isPending} className="rounded-lg bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-60">-10</button>
-                    <button type="button" onClick={() => setValue('currentLoad', currentLoad + 10)} disabled={!canManage || updateBinMutation.isPending} className="rounded-lg bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-60">+10</button>
-                    <button type="button" onClick={() => setValue('currentLoad', capacity)} disabled={!canManage || updateBinMutation.isPending} className="rounded-lg bg-blue-100 px-3 py-1.5 text-xs font-semibold text-blue-700 disabled:cursor-not-allowed disabled:opacity-60">Set Full</button>
-                  </div>
+                  <p className="text-[10px] text-slate-400 mt-1">Sức chứa thực tế được cập nhật qua kiểm kê ô bên dưới.</p>
                 </div>
 
                 <button
                   type="submit"
                   disabled={!canManage || updateBinMutation.isPending}
-                  className="w-full rounded-xl bg-blue-700 py-3 text-sm font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-blue-700 py-3 text-sm font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  {updateBinMutation.isPending ? 'Đang lưu cấu hình...' : canManage ? 'Lưu cấu hình sức chứa' : 'Bạn không có quyền chỉnh sửa'}
+                  {updateBinMutation.isPending ? (
+                    <>
+                      <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />
+                      Đang lưu cấu hình...
+                    </>
+                  ) : canManage ? 'Lưu cấu hình sức chứa' : 'Bạn không có quyền chỉnh sửa'}
                 </button>
               </motion.form>
             ) : (
@@ -623,34 +799,6 @@ export function ZoneDetail() {
             )}
           </div>
 
-          <div className="rounded-[2rem] bg-slate-100 p-6">
-            <h4 className="mb-4 flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-slate-900">
-              <span className="material-symbols-outlined text-sm">thermostat</span>
-              Zone Telemetry
-            </h4>
-            <div className="space-y-3 text-sm">
-              <p className="flex items-center justify-between"><span className="text-slate-600">Temperature</span><span className="font-bold text-slate-900">{selectedBin?.temperature?.toFixed(1) ?? 'N/A'}°C</span></p>
-              <p className="flex items-center justify-between"><span className="text-slate-600">Humidity</span><span className="font-bold text-slate-900">{selectedBin?.humidity?.toFixed(0) ?? 'N/A'}%</span></p>
-              <p className="flex items-center justify-between"><span className="text-slate-600">AGV Activity</span><span className="font-bold text-cyan-700">High (6 active)</span></p>
-            </div>
-          </div>
-
-          <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm">
-            <div className="mb-4 flex items-center gap-2">
-              <span className="material-symbols-outlined text-cyan-700">trending_up</span>
-              <h4 className="text-sm font-bold text-slate-900">Demand Forecast</h4>
-            </div>
-            <div className="mb-4 flex h-24 items-end gap-2">
-              <div className="h-[40%] flex-1 rounded-t-lg bg-slate-100"></div>
-              <div className="h-[60%] flex-1 rounded-t-lg bg-slate-100"></div>
-              <div className="h-[50%] flex-1 rounded-t-lg bg-slate-100"></div>
-              <div className="h-[90%] flex-1 rounded-t-lg bg-cyan-700"></div>
-              <div className="h-[75%] flex-1 rounded-t-lg bg-cyan-500"></div>
-              <div className="h-[55%] flex-1 rounded-t-lg bg-cyan-400"></div>
-              <div className="h-[40%] flex-1 rounded-t-lg bg-cyan-300"></div>
-            </div>
-            <p className="text-xs leading-relaxed text-slate-600">Zone {zone.code} expected to reach <span className="font-bold text-slate-900">98% capacity</span> in 4 days.</p>
-          </div>
         </div>
       </div>
     </div>

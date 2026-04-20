@@ -3,36 +3,39 @@ import * as inventoryService from "../services/inventory.service";
 import { catchAsync } from "../utils/catch-async";
 
 /**
- * Lấy danh sách tồn kho
+ * Tra cứu tồn kho
  * GET /api/inventories
  */
-export const getInventories = catchAsync(
-  async (req: Request, res: Response) => {
-    const query = {
-      page: Number(req.query.page) || 1,
-      limit: Number(req.query.limit) || 10,
-      product_id: req.query.product_id
-        ? Number(req.query.product_id)
-        : undefined,
-      warehouse_location_id: req.query.warehouse_location_id
-        ? Number(req.query.warehouse_location_id)
-        : undefined,
-    };
+export const getInventories = catchAsync(async (req: Request, res: Response) => {
+  const query = {
+    page: req.query.page ? Number(req.query.page) : 1,
+    limit: req.query.limit ? Number(req.query.limit) : 10,
+    product_id: req.query.product_id ? Number(req.query.product_id) : undefined,
+    warehouse_id: req.query.warehouse_id ? Number(req.query.warehouse_id) : undefined,
+    warehouse_location_id: req.query.warehouse_location_id
+      ? Number(req.query.warehouse_location_id)
+      : undefined,
+    lot_id: req.query.lot_id ? Number(req.query.lot_id) : undefined,
+    expires_before: req.query.expires_before
+      ? new Date(String(req.query.expires_before))
+      : undefined,
+    is_available: req.query.is_available !== undefined 
+      ? req.query.is_available === "true" 
+      : undefined,
+    search: req.query.search ? String(req.query.search) : undefined,
+  };
 
-    const result = await inventoryService.getInventories(query);
+  // Gọi service với object query đã được chuẩn hóa
+  const result = await inventoryService.getInventories(query);
 
-    res.status(200).json({
-      success: true,
-      data: result,
-      message: "Lấy danh sách inventory thành công",
-    });
-  },
-);
+  res.status(200).json({
+    success: true,
+    data: result,
+    message: "Tra cứu tồn kho thành công",
+  });
+});
 
-/**
- * Lấy chi tiết thông tin tồn kho theo ID
- * GET /api/inventories/:id
- */
+
 export const getInventoryById = catchAsync(
   async (req: Request, res: Response) => {
     const id = Number(req.params.id);
@@ -46,10 +49,6 @@ export const getInventoryById = catchAsync(
   },
 );
 
-/**
- * Tạo mới bản ghi tồn kho
- * POST /api/inventories
- */
 export const createInventory = catchAsync(
   async (req: Request, res: Response) => {
     const inventory = await inventoryService.createInventory(req.body);
@@ -62,10 +61,6 @@ export const createInventory = catchAsync(
   },
 );
 
-/**
- * Cập nhật thông tin tồn kho
- * PATCH /api/inventories/:id
- */
 export const updateInventory = catchAsync(
   async (req: Request, res: Response) => {
     const id = Number(req.params.id);
@@ -79,10 +74,6 @@ export const updateInventory = catchAsync(
   },
 );
 
-/**
- * Xóa bản ghi tồn kho
- * DELETE /api/inventories/:id
- */
 export const deleteInventory = catchAsync(
   async (req: Request, res: Response) => {
     const id = Number(req.params.id);
@@ -96,3 +87,46 @@ export const deleteInventory = catchAsync(
   },
 );
 
+/**
+ * Cảnh báo tồn kho
+ * GET /api/inventories/alerts
+ */
+export const getInventoryAlerts = catchAsync(async (req: Request, res: Response) => {
+  const alerts = await inventoryService.getInventoryAlerts(req.query as any);
+
+  res.status(200).json({
+    success: true,
+    data: alerts,
+    message: "Lấy danh sách cảnh báo tồn kho thành công",
+  });
+});
+
+/**
+ * Cập nhật hạn mức tồn kho
+ * PUT /api/inventories/products/:productId/thresholds
+ */
+export const updateThresholds = catchAsync(async (req: Request, res: Response) => {
+  const productId = Number(req.params.productId);
+  const result = await inventoryService.updateProductStockConfig(productId, req.body);
+
+  res.status(200).json({
+    success: true,
+    data: result,
+    message: "Cập nhật hạn mức tồn kho thành công",
+  });
+});
+
+/**
+ * Khóa sổ hệ thống
+ * POST /api/inventories/closing
+ */
+export const closePeriod = catchAsync(async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const result = await inventoryService.closeInventoryPeriod(req.body, userId);
+
+  res.status(201).json({
+    success: true,
+    data: result,
+    message: "Khóa sổ hệ thống thành công",
+  });
+});

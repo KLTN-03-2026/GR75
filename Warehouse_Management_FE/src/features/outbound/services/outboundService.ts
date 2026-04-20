@@ -1,102 +1,194 @@
 import apiClient from '@/services/apiClient';
 import type { ApiResponse } from '@/types/api';
+import { collectPaginatedItems } from '@/services/searchFallback';
+import {
+  getProductAvailableQtyFromBinFallback,
+  getProductPreferredLocationIdFromBinFallback,
+} from '@/services/warehouseService';
+import { getProductAvailableFromInventory } from '@/services/inventoryOverviewService';
 import type {
-  OutboundFormValues,
-  OutboundLineItemFormValues,
-  OutboundListParams,
-  OutboundListResponse,
-  OutboundOrder,
-  OutboundStatus,
-  PickingTask,
+  StockOut,
+  StockOutHistoryItem,
+  StockOutListParams,
+  StockOutListResponse,
+  CreateStockOutPayload,
+  UpdatePickedLotsPayload,
+  CancelStockOutPayload,
+  ProofType,
+  StockOutDiscrepancyRecord,
 } from '../types/outboundType';
 
-// ─── API Shape ────────────────────────────────────────────────────────────────
+const PRODUCT_AVAILABILITY_CACHE_TTL_MS = 20_000;
 
-interface OutboundLineItemApiItem {
-  id: number;
-  outbound_order_id: number;
+const productAvailabilityCache = new Map<
+  number,
+  { fetchedAt: number; data: { availableQty: number; preferredLocationId: number | null } }
+>();
+
+const pendingProductAvailability = new Map<
+  number,
+  Promise<{ availableQty: number; preferredLocationId: number | null }>
+>();
+
+interface ReviewInventoryRow {
   product_id: number;
-  product_code: string;
-  product_name: string;
   warehouse_location_id: number;
-  location_code: string;
-  unit_id: number;
-  unit_name: string;
-  lot_number: string;
-  expiry_date: string | null;
-  requested_qty: number;
-  picked_qty: number;
-  note: string;
+  available_quantity: number | string;
+  lots?: Array<{
+    id: number;
+    lot_no: string;
+  }>;
 }
 
-interface OutboundOrderApiItem {
-  id: number;
-  code: string;
-  status: OutboundStatus;
-  priority: 'LOW' | 'NORMAL' | 'HIGH' | 'URGENT';
-  warehouse_id: number;
-  warehouse_name: string;
-  requested_by: string;
-  confirmed_by: string | null;
-  note: string;
-  expected_date: string | null;
-  completed_at: string | null;
-  cancelled_at: string | null;
-  line_items?: OutboundLineItemApiItem[];
-  created_at: string;
-  updated_at: string;
-}
-
-interface OutboundListApiData {
-  outbound_orders: OutboundOrderApiItem[];
+interface ReviewInventoryPage {
+  items?: ReviewInventoryRow[];
+  inventories?: ReviewInventoryRow[];
   pagination: {
     page: number;
     limit: number;
-    total: number;
-    totalPages: number;
+    total_pages?: number;
+    totalPages?: number;
   };
 }
 
-// ─── Mappers ──────────────────────────────────────────────────────────────────
+export interface StockOutReviewSnapshot {
+  order: StockOut;
+  availableByProduct: Record<number, number>;
+}
 
-function mapLineItem(item: OutboundLineItemApiItem) {
+export interface StoredStockOutDiscrepancyResolution {
+  stockOutId: number;
+  discrepancyId: number;
+  reason: string;
+  actionTaken: string;
+  resolvedAt: string;
+}
+
+const STOCK_OUT_DISCREPANCY_STORAGE_KEY = 'wm:stock-out-discrepancy-resolution:v1';
+
+function readDiscrepancyResolutionStore(): Record<string, StoredStockOutDiscrepancyResolution> {
+  if (typeof window === 'undefined') {
+    return {};
+  }
+
+  try {
+    const raw = window.localStorage.getItem(STOCK_OUT_DISCREPANCY_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') {
+      return {};
+    }
+
+    return parsed as Record<string, StoredStockOutDiscrepancyResolution>;
+  } catch {
+    return {};
+  }
+}
+
+function writeDiscrepancyResolutionStore(store: Record<string, StoredStockOutDiscrepancyResolution>): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(STOCK_OUT_DISCREPANCY_STORAGE_KEY, JSON.stringify(store));
+  } catch {
+    // Silent fail: localStorage may be unavailable in private mode/quota exceeded.
+  }
+}
+
+export function saveStockOutDiscrepancyResolution(
+  data: StoredStockOutDiscrepancyResolution,
+): void {
+  const store = readDiscrepancyResolutionStore();
+  store[String(data.stockOutId)] = data;
+  writeDiscrepancyResolutionStore(store);
+}
+
+export function getStoredStockOutDiscrepancyResolution(
+  stockOutId: number,
+): StoredStockOutDiscrepancyResolution | null {
+  const store = readDiscrepancyResolutionStore();
+  return store[String(stockOutId)] ?? null;
+}
+
+export async function resolveProductLotCodeToId(
+  productId: number,
+  warehouseLocationId: number,
+  lotCode: string,
+): Promise<number | null> {
+  const normalizedLotCode = lotCode.trim().toLowerCase();
+  if (!normalizedLotCode) {
+    return null;
+  }
+
+  const rows = await collectPaginatedItems<ReviewInventoryPage, ReviewInventoryRow>({
+    fetchPage: async (page, limit) => {
+      const response = await apiClient.get<ApiResponse<ReviewInventoryPage>>('/api/inventories', {
+        params: {
+          page,
+          limit,
+          product_id: productId,
+          warehouse_location_id: warehouseLocationId,
+        },
+      });
+      return unwrap<ReviewInventoryPage>(response);
+    },
+    getItems: (payload) => payload.items ?? payload.inventories ?? [],
+    getTotalPages: (payload) => payload.pagination.total_pages ?? payload.pagination.totalPages ?? 1,
+  });
+
+  for (const row of rows) {
+    const lots = row.lots ?? [];
+    for (const lot of lots) {
+      const lotNo = String(lot.lot_no ?? '').trim().toLowerCase();
+      if (lotNo && lotNo === normalizedLotCode) {
+        return Number(lot.id);
+      }
+    }
+  }
+
+  return null;
+}
+
+export async function getOutboundProductInventoryAvailabilityAtLocation(
+  productId: number,
+  warehouseLocationId: number,
+): Promise<{
+  availableQty: number;
+  preferredLocationId: number | null;
+}> {
+  const rows = await collectPaginatedItems<ReviewInventoryPage, ReviewInventoryRow>({
+    fetchPage: async (page, limit) => {
+      const response = await apiClient.get<ApiResponse<ReviewInventoryPage>>('/api/inventories', {
+        params: {
+          page,
+          limit,
+          product_id: productId,
+          warehouse_location_id: warehouseLocationId,
+        },
+      });
+      return unwrap<ReviewInventoryPage>(response);
+    },
+    getItems: (payload) => payload.items ?? payload.inventories ?? [],
+    getTotalPages: (payload) => payload.pagination.total_pages ?? payload.pagination.totalPages ?? 1,
+  });
+
+  let availableQty = 0;
+  rows.forEach((row) => {
+    availableQty += Number(row.available_quantity) || 0;
+  });
+
   return {
-    id: String(item.id),
-    outboundOrderId: String(item.outbound_order_id),
-    productId: String(item.product_id),
-    productCode: item.product_code,
-    productName: item.product_name,
-    locationId: String(item.warehouse_location_id),
-    locationCode: item.location_code,
-    unitId: String(item.unit_id),
-    unitName: item.unit_name,
-    lotNumber: item.lot_number,
-    expiryDate: item.expiry_date,
-    requestedQty: item.requested_qty,
-    pickedQty: item.picked_qty,
-    note: item.note,
+    availableQty,
+    preferredLocationId: rows.length > 0 ? warehouseLocationId : null,
   };
 }
 
-function mapOutboundOrder(item: OutboundOrderApiItem): OutboundOrder {
-  return {
-    id: String(item.id),
-    code: item.code,
-    status: item.status,
-    priority: item.priority,
-    warehouseId: String(item.warehouse_id),
-    warehouseName: item.warehouse_name,
-    requestedBy: item.requested_by,
-    confirmedBy: item.confirmed_by,
-    note: item.note,
-    expectedDate: item.expected_date,
-    completedAt: item.completed_at,
-    cancelledAt: item.cancelled_at,
-    lineItems: (item.line_items ?? []).map(mapLineItem),
-    createdAt: item.created_at,
-    updatedAt: item.updated_at,
-  };
-}
+// ─── Helper unwrap ────────────────────────────────────────────────────────────
 
 function unwrap<T>(response: unknown): T {
   const r = response as { data?: { data?: T } | T };
@@ -106,437 +198,320 @@ function unwrap<T>(response: unknown): T {
   return (r?.data as T) ?? (response as T);
 }
 
-// ─── Mock Data (until backend is ready) ──────────────────────────────────────
+// ─── Danh sách phiếu xuất ─────────────────────────────────────────────────────
 
-let _mockOrders: OutboundOrder[] = [
-  {
-    id: '1',
-    code: 'OUT-2024-001',
-    status: 'PICKING',
-    priority: 'HIGH',
-    warehouseId: '1',
-    warehouseName: 'Kho Hà Nội',
-    requestedBy: 'Nguyễn Văn A',
-    confirmedBy: 'Trần Thị B',
-    note: 'Giao hàng gấp cho Lazada Express',
-    expectedDate: '2024-04-10',
-    completedAt: null,
-    cancelledAt: null,
-    lineItems: [
-      {
-        id: '1',
-        outboundOrderId: '1',
-        productId: '1',
-        productCode: 'WH-8821-BLK',
-        productName: 'Giày Chạy Bộ Pegasus - Đen (Size 42)',
-        locationId: '1',
-        locationCode: 'A-04-12',
-        unitId: '1',
-        unitName: 'Đôi',
-        lotNumber: 'LOT-2024-03-01',
-        expiryDate: null,
-        requestedQty: 2,
-        pickedQty: 2,
-        note: '',
-      },
-      {
-        id: '2',
-        outboundOrderId: '1',
-        productId: '2',
-        productCode: 'WH-1102-GRY',
-        productName: 'Túi Đeo Chéo Thể Thao - Xám',
-        locationId: '2',
-        locationCode: 'A-04-15',
-        unitId: '1',
-        unitName: 'Cái',
-        lotNumber: 'LOT-2024-02-15',
-        expiryDate: null,
-        requestedQty: 5,
-        pickedQty: 0,
-        note: '',
-      },
-      {
-        id: '3',
-        outboundOrderId: '1',
-        productId: '3',
-        productCode: 'WH-5520-BLU',
-        productName: 'Bình Nước Cách Nhiệt 1L',
-        locationId: '3',
-        locationCode: 'B-11-02',
-        unitId: '1',
-        unitName: 'Cái',
-        lotNumber: 'LOT-2024-01-20',
-        expiryDate: '2027-01-20',
-        requestedQty: 1,
-        pickedQty: 0,
-        note: '',
-      },
-    ],
-    createdAt: '2024-04-08T01:00:00Z',
-    updatedAt: '2024-04-08T02:00:00Z',
-  },
-  {
-    id: '2',
-    code: 'OUT-2024-002',
-    status: 'CONFIRMED',
-    priority: 'NORMAL',
-    warehouseId: '1',
-    warehouseName: 'Kho Hà Nội',
-    requestedBy: 'Lê Văn C',
-    confirmedBy: null,
-    note: '',
-    expectedDate: '2024-04-12',
-    completedAt: null,
-    cancelledAt: null,
-    lineItems: [
-      {
-        id: '4',
-        outboundOrderId: '2',
-        productId: '4',
-        productCode: 'WH-3300-RED',
-        productName: 'Áo Thể Thao Nike - Đỏ (XL)',
-        locationId: '4',
-        locationCode: 'C-02-01',
-        unitId: '1',
-        unitName: 'Cái',
-        lotNumber: 'LOT-2024-03-10',
-        expiryDate: null,
-        requestedQty: 10,
-        pickedQty: 0,
-        note: '',
-      },
-    ],
-    createdAt: '2024-04-07T08:00:00Z',
-    updatedAt: '2024-04-07T09:00:00Z',
-  },
-  {
-    id: '3',
-    code: 'OUT-2024-003',
-    status: 'DRAFT',
-    priority: 'LOW',
-    warehouseId: '2',
-    warehouseName: 'Kho HCM',
-    requestedBy: 'Phạm Thị D',
-    confirmedBy: null,
-    note: 'Đơn thường, không gấp',
-    expectedDate: '2024-04-15',
-    completedAt: null,
-    cancelledAt: null,
-    lineItems: [],
-    createdAt: '2024-04-06T10:00:00Z',
-    updatedAt: '2024-04-06T10:00:00Z',
-  },
-  {
-    id: '4',
-    code: 'OUT-2024-004',
-    status: 'COMPLETED',
-    priority: 'URGENT',
-    warehouseId: '1',
-    warehouseName: 'Kho Hà Nội',
-    requestedBy: 'Nguyễn Văn A',
-    confirmedBy: 'Trần Thị B',
-    note: '',
-    expectedDate: '2024-04-05',
-    completedAt: '2024-04-05T16:00:00Z',
-    cancelledAt: null,
-    lineItems: [],
-    createdAt: '2024-04-04T09:00:00Z',
-    updatedAt: '2024-04-05T16:00:00Z',
-  },
-  {
-    id: '5',
-    code: 'OUT-2024-005',
-    status: 'CANCELLED',
-    priority: 'NORMAL',
-    warehouseId: '2',
-    warehouseName: 'Kho HCM',
-    requestedBy: 'Trần Văn E',
-    confirmedBy: null,
-    note: 'Hủy do khách đổi ý',
-    expectedDate: null,
-    completedAt: null,
-    cancelledAt: '2024-04-03T11:00:00Z',
-    lineItems: [],
-    createdAt: '2024-04-02T14:00:00Z',
-    updatedAt: '2024-04-03T11:00:00Z',
-  },
-];
+export async function getStockOuts(params: StockOutListParams = {}): Promise<StockOutListResponse> {
+  const response = await apiClient.get<ApiResponse<StockOutListResponse>>('/api/stock-outs', {
+    params: {
+      page: params.page ?? 1,
+      limit: params.limit ?? 10,
+      status: params.status ?? undefined,
+      type: params.type ?? undefined,
+      search: params.search || undefined,
+    },
+  });
+  return unwrap<StockOutListResponse>(response);
+}
 
-let _nextId = 6;
+// ─── Chi tiết phiếu xuất ──────────────────────────────────────────────────────
 
-// ─── Service Functions ────────────────────────────────────────────────────────
+export async function getStockOutById(id: number): Promise<StockOut> {
+  const response = await apiClient.get<ApiResponse<StockOut>>(`/api/stock-outs/${id}`);
+  return unwrap<StockOut>(response);
+}
 
-export async function getOutboundOrders(params: OutboundListParams = {}): Promise<OutboundListResponse> {
-  // Try real API first
-  try {
-    const response = await apiClient.get<ApiResponse<OutboundListApiData>>('/api/outbound-orders', {
-      params: {
-        page: params.page ?? 1,
-        limit: params.pageSize ?? 10,
-        search: params.search,
-        status: params.status !== 'ALL' ? params.status : undefined,
-        warehouse_id: params.warehouseId ? Number(params.warehouseId) : undefined,
-        priority: params.priority,
-        date_from: params.dateFrom,
-        date_to: params.dateTo,
-      },
-    });
-    const payload = unwrap<OutboundListApiData>(response);
-    return {
-      data: payload.outbound_orders.map(mapOutboundOrder),
-      total: payload.pagination.total,
-      page: payload.pagination.page,
-      pageSize: payload.pagination.limit,
-      totalPages: payload.pagination.totalPages,
-    };
-  } catch {
-    // Fallback to mock
-    let filtered = [..._mockOrders];
-    if (params.search) {
-      const q = params.search.toLowerCase();
-      filtered = filtered.filter(
-        (o) => o.code.toLowerCase().includes(q) || o.warehouseName.toLowerCase().includes(q),
-      );
+/**
+ * Detail review snapshot: load stock-out detail and inventory state in parallel.
+ * This protects page load latency and gives realtime available qty for each line item.
+ */
+export async function getStockOutReviewSnapshot(id: number): Promise<StockOutReviewSnapshot> {
+  const inventoryTask = collectPaginatedItems<ReviewInventoryPage, ReviewInventoryRow>({
+    fetchPage: async (page, limit) => {
+      const response = await apiClient.get<ApiResponse<ReviewInventoryPage>>('/api/inventories', {
+        params: { page, limit },
+      });
+      return unwrap<ReviewInventoryPage>(response);
+    },
+    getItems: (payload) => payload.items ?? payload.inventories ?? [],
+    getTotalPages: (payload) => payload.pagination.total_pages ?? payload.pagination.totalPages ?? 1,
+  });
+
+  const [order, inventoryRows] = await Promise.all([
+    getStockOutById(id),
+    inventoryTask,
+  ]);
+
+  const availableByProduct: Record<number, number> = {};
+  const lineProductIds = new Set(order.details.map((detail) => detail.product_id));
+
+  order.details.forEach((detail) => {
+    availableByProduct[detail.product_id] = 0;
+  });
+
+  inventoryRows.forEach((row) => {
+    const rowProductId = Number(row.product_id);
+    if (!lineProductIds.has(rowProductId)) {
+      return;
     }
-    if (params.status && params.status !== 'ALL') {
-      filtered = filtered.filter((o) => o.status === params.status);
-    }
-    if (params.warehouseId) {
-      filtered = filtered.filter((o) => o.warehouseId === params.warehouseId);
-    }
-    const page = params.page ?? 1;
-    const pageSize = params.pageSize ?? 10;
-    const total = filtered.length;
-    const totalPages = Math.ceil(total / pageSize);
-    const data = filtered.slice((page - 1) * pageSize, page * pageSize);
-    return { data, total, page, pageSize, totalPages };
+
+    availableByProduct[rowProductId] =
+      (availableByProduct[rowProductId] ?? 0) + (Number(row.available_quantity) || 0);
+  });
+
+  return {
+    order,
+    availableByProduct,
+  };
+}
+
+// ─── Tạo phiếu xuất bán ──────────────────────────────────────────────────────
+
+export async function createSalesStockOut(payload: CreateStockOutPayload): Promise<StockOut> {
+  const response = await apiClient.post<ApiResponse<StockOut>>('/api/stock-outs/sales', {
+    warehouse_location_id: payload.warehouse_location_id,
+    type: payload.type,
+    reference_number: payload.reference_number || undefined,
+    supplier_id: payload.supplier_id || undefined,
+    description: payload.description || undefined,
+    details: payload.details,
+  });
+  return unwrap<StockOut>(response);
+}
+
+// ─── Tạo phiếu trả NCC ───────────────────────────────────────────────────────
+
+export async function createReturnStockOut(payload: CreateStockOutPayload): Promise<StockOut> {
+  const response = await apiClient.post<ApiResponse<StockOut>>('/api/stock-outs/returns', {
+    warehouse_location_id: payload.warehouse_location_id,
+    type: payload.type,
+    reference_number: payload.reference_number || undefined,
+    supplier_id: payload.supplier_id || undefined,
+    description: payload.description || undefined,
+    details: payload.details,
+  });
+  return unwrap<StockOut>(response);
+}
+
+// ─── Gửi duyệt (DRAFT → PENDING) ─────────────────────────────────────────────
+
+export async function submitStockOut(id: number): Promise<StockOut> {
+  const response = await apiClient.patch<ApiResponse<StockOut>>(`/api/stock-outs/${id}/submit`);
+  return unwrap<StockOut>(response);
+}
+
+// ─── Phê duyệt (PENDING → APPROVED) ──────────────────────────────────────────
+
+export async function approveStockOut(id: number): Promise<StockOut> {
+  const response = await apiClient.patch<ApiResponse<StockOut>>(`/api/stock-outs/${id}/approve`);
+  return unwrap<StockOut>(response);
+}
+
+// ─── Gán lô hàng (APPROVED/PICKING) ──────────────────────────────────────────
+// BE thay thế TOÀN BỘ lot assignments mỗi lần gọi
+
+export async function updatePickedLots(
+  id: number,
+  payload: UpdatePickedLotsPayload,
+): Promise<StockOut> {
+  const response = await apiClient.put<ApiResponse<StockOut>>(
+    `/api/stock-outs/${id}/picked-lots`,
+    payload,
+  );
+  return unwrap<StockOut>(response);
+}
+
+// ─── Hoàn tất phiếu xuất (PICKING → COMPLETED) ───────────────────────────────
+
+export async function completeStockOut(id: number): Promise<StockOut> {
+  const response = await apiClient.patch<ApiResponse<StockOut>>(`/api/stock-outs/${id}/complete`);
+  return unwrap<StockOut>(response);
+}
+
+export async function createStockOutDiscrepancy(
+  id: number,
+  payload: { reason: string },
+): Promise<StockOutDiscrepancyRecord> {
+  const response = await apiClient.post<ApiResponse<StockOutDiscrepancyRecord>>(
+    `/api/stock-outs/${id}/discrepancies`,
+    payload,
+  );
+  return unwrap<StockOutDiscrepancyRecord>(response);
+}
+
+export async function resolveStockOutDiscrepancy(
+  id: number,
+  discrepancyId: number,
+  payload: { action_taken: string },
+): Promise<StockOutDiscrepancyRecord> {
+  const response = await apiClient.patch<ApiResponse<StockOutDiscrepancyRecord>>(
+    `/api/stock-outs/${id}/discrepancies/${discrepancyId}/resolve`,
+    payload,
+  );
+  return unwrap<StockOutDiscrepancyRecord>(response);
+}
+
+// ─── Hủy phiếu xuất ──────────────────────────────────────────────────────────
+
+export async function cancelStockOut(
+  id: number,
+  payload: CancelStockOutPayload,
+): Promise<StockOut> {
+  const response = await apiClient.patch<ApiResponse<StockOut>>(
+    `/api/stock-outs/${id}/cancel`,
+    payload,
+  );
+  return unwrap<StockOut>(response);
+}
+
+// ─── Proof Upload — Pending BE Integration ────────────────────────────────────
+// Flow: FE lấy presigned URL → upload thẳng lên B2 → confirm với BE
+// Endpoint /api/stock-outs/:id/proof-upload-url chưa được triển khai trên BE.
+
+export async function getProofUploadUrl(
+  stockOutId: number,
+  fileName: string,
+  fileType: string,
+): Promise<{ url: string; key: string }> {
+  const response = await apiClient.post<ApiResponse<{ url: string; key: string }>>(
+    `/api/stock-outs/${stockOutId}/proof-upload-url`,
+    { file_name: fileName, file_type: fileType },
+  );
+  return unwrap<{ url: string; key: string }>(response);
+}
+
+/** Upload file trực tiếp lên Backblaze B2 qua presigned URL (không đi qua BE) */
+export async function uploadFileToB2(presignedUrl: string, file: File): Promise<void> {
+  const res = await fetch(presignedUrl, {
+    method: 'PUT',
+    body: file,
+    headers: { 'Content-Type': file.type },
+  });
+  if (!res.ok) {
+    throw new Error(`Upload thất bại: ${res.statusText}`);
   }
 }
 
-export async function getOutboundOrder(id: string): Promise<OutboundOrder> {
-  try {
-    const response = await apiClient.get<ApiResponse<OutboundOrderApiItem>>(`/api/outbound-orders/${id}`);
-    return mapOutboundOrder(unwrap<OutboundOrderApiItem>(response));
-  } catch {
-    const order = _mockOrders.find((o) => o.id === id);
-    if (!order) throw new Error(`Không tìm thấy phiếu xuất #${id}`);
-    return { ...order };
-  }
-}
-
-export async function createOutboundOrder(values: OutboundFormValues): Promise<OutboundOrder> {
-  try {
-    const response = await apiClient.post<ApiResponse<OutboundOrderApiItem>>('/api/outbound-orders', {
-      warehouse_id: Number(values.warehouseId),
-      priority: values.priority,
-      expected_date: values.expectedDate || null,
-      note: values.note,
-      line_items: values.lineItems.map((li) => ({
-        product_id: Number(li.productId),
-        warehouse_location_id: Number(li.locationId),
-        unit_id: Number(li.unitId),
-        lot_number: li.lotNumber,
-        expiry_date: li.expiryDate || null,
-        requested_qty: li.requestedQty,
-        note: li.note,
-      })),
-    });
-    return mapOutboundOrder(unwrap<OutboundOrderApiItem>(response));
-  } catch {
-    // Mock create
-    const newOrder: OutboundOrder = {
-      id: String(_nextId++),
-      code: `OUT-2024-${String(_nextId).padStart(3, '0')}`,
-      status: 'DRAFT',
-      priority: values.priority,
-      warehouseId: values.warehouseId,
-      warehouseName: `Kho #${values.warehouseId}`,
-      requestedBy: 'Current User',
-      confirmedBy: null,
-      note: values.note,
-      expectedDate: values.expectedDate || null,
-      completedAt: null,
-      cancelledAt: null,
-      lineItems: values.lineItems.map((li, idx) => ({
-        id: String(1000 + idx),
-        outboundOrderId: String(_nextId - 1),
-        productId: li.productId,
-        productCode: `SKU-${li.productId}`,
-        productName: `Sản phẩm #${li.productId}`,
-        locationId: li.locationId,
-        locationCode: `LOC-${li.locationId}`,
-        unitId: li.unitId,
-        unitName: 'Cái',
-        lotNumber: li.lotNumber,
-        expiryDate: li.expiryDate || null,
-        requestedQty: li.requestedQty,
-        pickedQty: 0,
-        note: li.note,
-      })),
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    _mockOrders.unshift(newOrder);
-    return { ...newOrder };
-  }
-}
-
-export async function updateOutboundOrder(
-  id: string,
-  values: Partial<OutboundFormValues>,
-): Promise<OutboundOrder> {
-  try {
-    const response = await apiClient.patch<ApiResponse<OutboundOrderApiItem>>(`/api/outbound-orders/${id}`, {
-      priority: values.priority,
-      expected_date: values.expectedDate || null,
-      note: values.note,
-      line_items: values.lineItems?.map((li) => ({
-        product_id: Number(li.productId),
-        warehouse_location_id: Number(li.locationId),
-        unit_id: Number(li.unitId),
-        lot_number: li.lotNumber,
-        expiry_date: li.expiryDate || null,
-        requested_qty: li.requestedQty,
-        note: li.note,
-      })),
-    });
-    return mapOutboundOrder(unwrap<OutboundOrderApiItem>(response));
-  } catch {
-    const idx = _mockOrders.findIndex((o) => o.id === id);
-    if (idx === -1) throw new Error('Không tìm thấy phiếu xuất');
-    const existing = _mockOrders[idx];
-    const updated: OutboundOrder = {
-      ...existing,
-      priority: values.priority ?? existing.priority,
-      expectedDate: values.expectedDate ?? existing.expectedDate,
-      note: values.note ?? existing.note,
-      updatedAt: new Date().toISOString(),
-    };
-    _mockOrders[idx] = updated;
-    return { ...updated };
-  }
-}
-
-export async function transitionOutboundStatus(
-  id: string,
-  newStatus: OutboundStatus,
-  note?: string,
-): Promise<OutboundOrder> {
-  try {
-    const response = await apiClient.patch<ApiResponse<OutboundOrderApiItem>>(
-      `/api/outbound-orders/${id}/status`,
-      { status: newStatus, note },
-    );
-    return mapOutboundOrder(unwrap<OutboundOrderApiItem>(response));
-  } catch {
-    const idx = _mockOrders.findIndex((o) => o.id === id);
-    if (idx === -1) throw new Error('Không tìm thấy phiếu xuất');
-    const existing = _mockOrders[idx];
-    const now = new Date().toISOString();
-    const updated: OutboundOrder = {
-      ...existing,
-      status: newStatus,
-      completedAt: newStatus === 'COMPLETED' ? now : existing.completedAt,
-      cancelledAt: newStatus === 'CANCELLED' ? now : existing.cancelledAt,
-      updatedAt: now,
-    };
-    _mockOrders[idx] = updated;
-    return { ...updated };
-  }
-}
-
-export async function updateLineItemPickedQty(
-  orderId: string,
-  lineItemId: string,
-  pickedQty: number,
+/** Báo BE ghi nhận proof đã upload thành công */
+export async function confirmProofUpload(
+  stockOutId: number,
+  key: string,
+  type: ProofType,
 ): Promise<void> {
-  try {
-    await apiClient.patch(`/api/outbound-orders/${orderId}/line-items/${lineItemId}`, {
-      picked_qty: pickedQty,
-    });
-  } catch {
-    const orderIdx = _mockOrders.findIndex((o) => o.id === orderId);
-    if (orderIdx === -1) return;
-    const lineItemIdx = _mockOrders[orderIdx].lineItems.findIndex((li) => li.id === lineItemId);
-    if (lineItemIdx === -1) return;
-    _mockOrders[orderIdx].lineItems[lineItemIdx].pickedQty = pickedQty;
-  }
+  await apiClient.post(`/api/stock-outs/${stockOutId}/proofs`, { key, type });
 }
 
-export async function getPickingTasks(orderId: string): Promise<PickingTask[]> {
-  try {
-    const response = await apiClient.get<ApiResponse<{ tasks: PickingTask[] }>>(
-      `/api/outbound-orders/${orderId}/picking-tasks`,
-    );
-    return unwrap<{ tasks: PickingTask[] }>(response).tasks;
-  } catch {
-    // Build picking tasks from mock order line items
-    const order = _mockOrders.find((o) => o.id === orderId);
-    if (!order) return [];
+// ─── Lịch sử thao tác phiếu xuất ─────────────────────────────────────────────
+// Lấy danh sách audit log của một phiếu xuất, sắp xếp theo thời gian tăng dần
 
-    const locationParts = (code: string) => {
-      const parts = code.split('-');
-      return {
-        aisle: parts[0] ?? '',
-        rack: parts[1] ?? '',
-        level: parts[2] ?? '',
-        bin: parts[3] ?? '',
-      };
-    };
-
-    return order.lineItems.map((li, idx): PickingTask => {
-      const loc = locationParts(li.locationCode);
-      let taskStatus: PickingTask['status'] = 'PENDING';
-      if (li.pickedQty >= li.requestedQty) taskStatus = 'DONE';
-      else if (li.pickedQty > 0) taskStatus = 'IN_PROGRESS';
-
-      return {
-        id: `task-${li.id}`,
-        outboundOrderId: orderId,
-        outboundOrderCode: order.code,
-        lineItemId: li.id,
-        productId: li.productId,
-        productCode: li.productCode,
-        productName: li.productName,
-        locationId: li.locationId,
-        locationCode: li.locationCode,
-        aisle: loc.aisle,
-        rack: loc.rack,
-        level: loc.level,
-        bin: loc.bin,
-        lotNumber: li.lotNumber,
-        expiryDate: li.expiryDate,
-        requestedQty: li.requestedQty,
-        pickedQty: li.pickedQty,
-        unitName: li.unitName,
-        status: taskStatus,
-        sortOrder: idx,
-      };
-    });
-  }
+export async function getStockOutHistory(id: number): Promise<StockOutHistoryItem[]> {
+  // BE hiện tại chưa expose endpoint history cho stock-out.
+  // Trả rỗng để tránh 404 và giữ trang review ổn định.
+  void id;
+  return [];
 }
 
-export async function addLineItems(
-  orderId: string,
-  items: OutboundLineItemFormValues[],
-): Promise<OutboundOrder> {
+/**
+ * Đọc số lượng tồn kho khả dụng của sản phẩm.
+ *
+ * Chiến lược hai lớp (chạy song song):
+ *  1. localStorage fallback — đọc currentLoad từ `wm:bin-assignment-scope` (ghi bởi Zone Detail).
+ *     Đây là nguồn chính xác nhất ngay sau khi operator cập nhật bin, vì API có thể chậm đồng bộ.
+ *  2. API /api/inventories — nguồn chính thức, dùng khi fallback chưa có dữ liệu.
+ *
+ * Ưu tiên: fallback > 0 → dùng fallback; ngược lại → dùng API.
+ */
+export async function getOutboundProductInventoryAvailability(productId: number): Promise<{
+  availableQty: number;
+  preferredLocationId: number | null;
+}> {
+  return getOutboundProductInventoryAvailabilityWithOptions(productId);
+}
+
+interface GetOutboundAvailabilityOptions {
+  forceNetwork?: boolean;
+}
+
+export async function getOutboundProductInventoryAvailabilityWithOptions(
+  productId: number,
+  options?: GetOutboundAvailabilityOptions,
+): Promise<{
+  availableQty: number;
+  preferredLocationId: number | null;
+}> {
+  const forceNetwork = options?.forceNetwork === true;
+
+  const cached = productAvailabilityCache.get(productId);
+  if (!forceNetwork && cached && Date.now() - cached.fetchedAt < PRODUCT_AVAILABILITY_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const pending = pendingProductAvailability.get(productId);
+  if (!forceNetwork && pending) {
+    return pending;
+  }
+
+  const task = (async () => {
+    // Lớp 1: đọc localStorage đồng bộ — không tốn network, luôn phản ánh lần lưu bin gần nhất
+    const fallbackQty = getProductAvailableQtyFromBinFallback(String(productId));
+    const fallbackPreferredLocationId = getProductPreferredLocationIdFromBinFallback(String(productId));
+
+    // Fast-path: nếu fallback đã có dữ liệu dương, ưu tiên trả ngay để UI phản hồi tức thì.
+    if (!forceNetwork && fallbackQty > 0) {
+      const fastResult = {
+        availableQty: fallbackQty,
+        preferredLocationId: fallbackPreferredLocationId,
+      };
+      productAvailabilityCache.set(productId, {
+        fetchedAt: Date.now(),
+        data: fastResult,
+      });
+      return fastResult;
+    }
+
+    // Lớp 2: dùng cùng logic với Inventory Overview: quét full inventory rows rồi cộng available_quantity theo product_id.
+    let apiQty = 0;
+    let preferredLocationId: number | null = null;
+    let apiSucceeded = false;
+
+    try {
+      const fromInventory = await getProductAvailableFromInventory(productId);
+      apiQty = fromInventory.availableQty;
+      preferredLocationId = fromInventory.preferredLocationId;
+
+      apiSucceeded = true;
+    } catch {
+      if (fallbackQty <= 0) {
+        throw new Error('Cannot load inventory availability for this product at the moment.');
+      }
+    }
+
+    // Ưu tiên fallback khi có dữ liệu (operator vừa lưu bin trong Zone Detail)
+    // vì API inventory có thể chưa phản ánh đúng ngay sau thao tác cập nhật bin.
+    const availableQty = fallbackQty > 0 ? fallbackQty : apiQty;
+    const resolvedPreferredLocationId = preferredLocationId ?? fallbackPreferredLocationId;
+
+    if (!apiSucceeded && fallbackQty <= 0) {
+      throw new Error('Inventory availability is unavailable. Please retry.');
+    }
+
+    const result = { availableQty, preferredLocationId: resolvedPreferredLocationId };
+    productAvailabilityCache.set(productId, {
+      fetchedAt: Date.now(),
+      data: result,
+    });
+
+    return result;
+  })();
+
+  if (!forceNetwork) {
+    pendingProductAvailability.set(productId, task);
+  }
+
   try {
-    const response = await apiClient.post<ApiResponse<OutboundOrderApiItem>>(
-      `/api/outbound-orders/${orderId}/line-items`,
-      {
-        line_items: items.map((li) => ({
-          product_id: Number(li.productId),
-          warehouse_location_id: Number(li.locationId),
-          unit_id: Number(li.unitId),
-          lot_number: li.lotNumber,
-          expiry_date: li.expiryDate || null,
-          requested_qty: li.requestedQty,
-          note: li.note,
-        })),
-      },
-    );
-    return mapOutboundOrder(unwrap<OutboundOrderApiItem>(response));
-  } catch {
-    return getOutboundOrder(orderId);
+    return await task;
+  } finally {
+    if (!forceNetwork) {
+      pendingProductAvailability.delete(productId);
+    }
   }
 }

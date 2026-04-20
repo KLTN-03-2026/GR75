@@ -1,313 +1,1138 @@
-import { useState, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { useOutboundOrder, usePickingTasks, useUpdatePickedQty, useTransitionOutboundStatus } from '../hooks/useOutbound';
-import type { PickingTask } from '../types/outboundType';
+import { motion, AnimatePresence } from 'motion/react';
+import { useStockOut, useUpdatePickedLots, useCompleteStockOut } from '../hooks/useOutbound';
+import { useToast } from '@/hooks/use-toast';
+import {
+  createStockOutDiscrepancy,
+  resolveProductLotCodeToId,
+  saveStockOutDiscrepancyResolution,
+  resolveStockOutDiscrepancy,
+} from '../services/outboundService';
+import type {
+  StockOutDetail,
+  PickedLotEntry,
+  StockOutDiscrepancy,
+} from '../types/outboundType';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface LotAssignment {
+  lotValue: string;
+  quantity: number;
+}
+
+const DISCREPANCY_REASON_MIN_LENGTH = 5;
+const DISCREPANCY_REASON_MAX_LENGTH = 500;
+
+/** Gán lô: detailId → danh sách lô */
+type DetailAssignments = Record<number, LotAssignment[]>;
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
+
+/** Header cố định trên cùng */
+function PickingHeader({
+  code,
+  onBack,
+  onRefresh,
+}: {
+  code: string;
+  onBack: () => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <header className="sticky top-0 z-30 bg-white border-b border-slate-100 shadow-sm px-4 py-3 flex items-center justify-between">
+      <button
+        onClick={onBack}
+        className="flex items-center gap-2 text-slate-500 hover:text-blue-700 transition-colors"
+      >
+        <span className="material-symbols-outlined text-[20px]">arrow_back</span>
+        <span className="text-sm font-semibold hidden sm:block">Chi tiết phiếu</span>
+      </button>
+      <div className="text-center">
+        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Lấy hàng</p>
+        <p className="text-sm font-extrabold text-blue-900 leading-tight">{code}</p>
+      </div>
+      <button
+        onClick={onRefresh}
+        className="p-2 text-slate-400 hover:text-blue-600 hover:bg-slate-100 rounded-lg transition-colors"
+        title="Làm mới dữ liệu"
+      >
+        <span className="material-symbols-outlined text-[20px]">refresh</span>
+      </button>
+    </header>
+  );
+}
+
+/** Thanh tiến độ */
+function ProgressBar({ pct }: { pct: number }) {
+  return (
+    <div className="bg-white rounded-xl border border-slate-100 shadow-sm p-5">
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-xs font-bold text-slate-700">Tiến độ lấy hàng</p>
+        <motion.span
+          key={pct}
+          initial={{ scale: 1.2 }}
+          animate={{ scale: 1 }}
+          className={`text-base font-extrabold ${pct === 100 ? 'text-emerald-600' : 'text-blue-700'}`}
+        >
+          {pct}%
+        </motion.span>
+      </div>
+      <div className="h-4 bg-slate-100 rounded-full overflow-hidden">
+        <motion.div
+          className={`h-full rounded-full ${pct === 100 ? 'bg-emerald-500' : 'bg-linear-to-r from-blue-600 to-blue-400'}`}
+          initial={{ width: '0%' }}
+          animate={{ width: `${pct}%` }}
+          transition={{ duration: 0.5, ease: 'easeOut' }}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** Một dòng lô gán cho detail */
+function LotRow({
+  lotIdx,
+  assignment,
+  detail,
+  onChange,
+  onRemove,
+  canRemove,
+}: {
+  lotIdx: number;
+  assignment: LotAssignment;
+  detail: StockOutDetail;
+  onChange: (field: keyof LotAssignment, value: string | number) => void;
+  onRemove: () => void;
+  canRemove: boolean;
+}) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, x: -8 }}
+      animate={{ opacity: 1, x: 0 }}
+      exit={{ opacity: 0, x: -8 }}
+      transition={{ duration: 0.15 }}
+      className="grid grid-cols-[28px_minmax(0,1fr)_110px_auto] items-center gap-2 rounded-xl bg-white/80 p-2 ring-1 ring-slate-100"
+    >
+      <span className="text-[10px] font-bold text-slate-400 w-5 shrink-0">L{lotIdx + 1}</span>
+
+      {/* Lot ID */}
+      <div className="flex-1 min-w-0">
+        <input
+          type="text"
+          value={assignment.lotValue}
+          onChange={(e) => onChange('lotValue', e.target.value)}
+          placeholder="VD: LOT-GDS-013-00011-001 hoặc ID số"
+          className="w-full px-3 py-3 text-sm font-semibold bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400 focus:bg-white transition-colors placeholder:text-slate-300 placeholder:font-normal"
+          style={{ minHeight: 48 }}
+        />
+      </div>
+
+      {/* Quantity */}
+      <div className="w-28 shrink-0">
+        <input
+          type="number"
+          min={0.01}
+          step="any"
+          value={assignment.quantity || ''}
+          onChange={(e) => onChange('quantity', parseFloat(e.target.value) || 0)}
+          placeholder={`/ ${detail.quantity}`}
+          className="w-full px-3 py-3 text-base font-semibold text-center bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400 focus:bg-white transition-colors placeholder:text-slate-300 placeholder:font-normal"
+          style={{ minHeight: 48 }}
+        />
+      </div>
+
+      {/* Remove */}
+      {canRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity p-2 text-slate-300 hover:text-red-500 rounded-lg"
+        >
+          <span className="material-symbols-outlined text-[18px]">close</span>
+        </button>
+      )}
+    </motion.div>
+  );
+}
+
+/** Card cho một StockOutDetail */
+function DetailCard({
+  detail,
+  assignments,
+  onAssignmentsChange,
+  idx,
+}: {
+  detail: StockOutDetail;
+  assignments: LotAssignment[];
+  onAssignmentsChange: (lots: LotAssignment[]) => void;
+  idx: number;
+}) {
+  const pickedQty = assignments.reduce((s, l) => s + (l.quantity || 0), 0);
+  const required = detail.quantity;
+  const isFulfilled = pickedQty >= required;
+  const isOver = pickedQty > required;
+
+  const addLotRow = () => {
+    onAssignmentsChange([...assignments, { lotValue: '', quantity: 0 }]);
+  };
+
+  const updateRow = (i: number, field: keyof LotAssignment, value: string | number) => {
+    const next = assignments.map((a, idx2) => (idx2 === i ? { ...a, [field]: value } : a));
+    onAssignmentsChange(next);
+  };
+
+  const removeRow = (i: number) => {
+    onAssignmentsChange(assignments.filter((_, idx2) => idx2 !== i));
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25, delay: idx * 0.04 }}
+      className={`rounded-2xl border-2 overflow-hidden ${isFulfilled && !isOver
+        ? 'border-emerald-200 bg-emerald-50/30'
+        : isOver
+          ? 'border-amber-200 bg-amber-50/30'
+          : 'border-slate-200 bg-white'
+        }`}
+    >
+      {/* Product info */}
+      <div className="px-4 pt-4 pb-3 flex items-start justify-between gap-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center shrink-0">
+            <span className="material-symbols-outlined text-slate-400 text-[20px]">package_2</span>
+          </div>
+          <div className="min-w-0">
+            <p className="text-sm font-bold text-slate-800 truncate">
+              {detail.product?.name ?? `SP #${detail.product_id}`}
+            </p>
+            <p className="text-[10px] text-slate-400 font-mono mt-0.5">
+              {detail.product?.sku ?? '—'}
+            </p>
+          </div>
+        </div>
+
+        {/* Fulfillment status */}
+        <div className="shrink-0 text-right">
+          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Yêu cầu</p>
+          <p className="text-base font-extrabold text-blue-900 leading-tight">{required}</p>
+          <p className={`text-xs font-bold ${isFulfilled && !isOver ? 'text-emerald-600' : isOver ? 'text-amber-600' : 'text-slate-400'}`}>
+            Đã gán: {pickedQty}
+          </p>
+        </div>
+      </div>
+
+      {/* Status bar */}
+      <div className="px-4 pb-1">
+        <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+          <motion.div
+            className={`h-full rounded-full ${isOver ? 'bg-amber-400' : 'bg-blue-500'}`}
+            animate={{ width: `${Math.min((pickedQty / required) * 100, 100)}%` }}
+            transition={{ duration: 0.3 }}
+          />
+        </div>
+      </div>
+
+      {/* Lot rows */}
+      <div className="px-4 py-3 space-y-2.5">
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+            Mã lô ← Số lượng
+          </p>
+          {isOver && (
+            <span className="text-[10px] font-bold text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full">
+              Vượt quá yêu cầu
+            </span>
+          )}
+          {isFulfilled && !isOver && (
+            <span className="flex items-center gap-0.5 text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full">
+              <span className="material-symbols-outlined text-[12px]">check_circle</span>
+              Đủ số lượng
+            </span>
+          )}
+        </div>
+
+        <AnimatePresence initial={false}>
+          {assignments.map((a, i) => (
+            <LotRow
+              key={i}
+              lotIdx={i}
+              assignment={a}
+              detail={detail}
+              onChange={(field, val) => updateRow(i, field, val)}
+              onRemove={() => removeRow(i)}
+              canRemove={assignments.length > 1}
+            />
+          ))}
+        </AnimatePresence>
+
+        <button
+          type="button"
+          onClick={addLotRow}
+          className="w-full flex items-center justify-center gap-1.5 py-2.5 text-xs font-semibold text-blue-600 hover:bg-blue-50 rounded-xl border border-dashed border-blue-200 transition-colors"
+        >
+          <span className="material-symbols-outlined text-[15px]">add</span>
+          Thêm lô khác (tách lô)
+        </button>
+      </div>
+    </motion.div>
+  );
+}
+
+/** Panel hiển thị lệch số lượng khi hoàn tất thất bại */
+function DiscrepancyPanel({
+  open,
+  discrepancies,
+  errorMessage,
+  onGoBack,
+  resolutionMeasure,
+  onResolutionMeasureChange,
+  onContinue,
+  continueDisabled,
+}: {
+  open: boolean;
+  discrepancies: StockOutDiscrepancy[];
+  errorMessage: string;
+  onGoBack: () => void;
+  resolutionMeasure: string;
+  onResolutionMeasureChange: (value: string) => void;
+  onContinue: () => void;
+  continueDisabled: boolean;
+}) {
+  if (!open) {
+    return null;
+  }
+
+  const normalized = resolutionMeasure.replace(/\s+/g, ' ').trim();
+  const validationErrors: string[] = [];
+
+  if (normalized.length === 0) {
+    validationErrors.push('Vui lòng nhập lý do xử lý sự cố.');
+  }
+  if (normalized.length > 0 && normalized.length < DISCREPANCY_REASON_MIN_LENGTH) {
+    validationErrors.push(`Lý do phải có tối thiểu ${DISCREPANCY_REASON_MIN_LENGTH} ký tự.`);
+  }
+  if (normalized.length > DISCREPANCY_REASON_MAX_LENGTH) {
+    validationErrors.push(`Lý do không được vượt quá ${DISCREPANCY_REASON_MAX_LENGTH} ký tự.`);
+  }
+  if (normalized.length > 0 && !/[\p{L}\p{N}]/u.test(normalized)) {
+    validationErrors.push('Lý do phải chứa ít nhất 1 chữ hoặc số hợp lệ.');
+  }
+
+  const resolutionError = validationErrors.length > 0;
+  const remainingChars = DISCREPANCY_REASON_MAX_LENGTH - normalized.length;
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-60 flex items-center justify-center p-4"
+      >
+        <button
+          type="button"
+          className="absolute inset-0 bg-black/40"
+          onClick={onGoBack}
+          aria-label="Đóng xử lý sự cố"
+        />
+
+        <motion.div
+          initial={{ opacity: 0, y: 8, scale: 0.97 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 8, scale: 0.97 }}
+          className="relative z-10 w-full max-w-2xl overflow-hidden rounded-2xl border-2 border-red-200 bg-red-50 shadow-2xl"
+        >
+          <div className="flex items-start justify-between gap-3 border-b border-red-200 bg-red-100 px-5 py-4">
+            <div className="flex items-start gap-3">
+              <span className="material-symbols-outlined text-base text-red-600">warning</span>
+              <div>
+                <h3 className="text-sm font-bold text-red-800">Xử lý sự cố số lượng</h3>
+                <p className="text-xs text-red-600">{errorMessage}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={onGoBack}
+              className="rounded-lg p-1 text-red-500 transition-colors hover:bg-red-200/70 hover:text-red-700"
+              aria-label="Đóng xử lý sự cố"
+            >
+              <span className="material-symbols-outlined text-[18px]">close</span>
+            </button>
+          </div>
+
+          <div className="max-h-[45vh] space-y-2 overflow-y-auto p-4">
+            {discrepancies.map((d) => (
+              <div
+                key={d.stock_out_detail_id}
+                className="flex items-center justify-between gap-3 rounded-xl border border-red-100 bg-white px-4 py-3"
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold text-slate-800">{d.product_name}</p>
+                  <p className="font-mono text-[10px] text-slate-400">{d.product_sku}</p>
+                </div>
+                <div className="shrink-0 text-right text-xs">
+                  <p className="text-slate-500">
+                    Yêu cầu: <span className="font-bold text-slate-800">{d.required_quantity}</span>
+                  </p>
+                  <p className="text-slate-500">
+                    Đã gán: <span className="font-bold text-slate-800">{d.picked_quantity}</span>
+                  </p>
+                  <p className={`font-bold ${d.difference < 0 ? 'text-red-600' : 'text-amber-600'}`}>
+                    {d.difference < 0 ? `Thiếu ${Math.abs(d.difference)}` : `Thừa ${d.difference}`}
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="space-y-3 px-4 pb-4">
+            <div>
+              <label htmlFor="discrepancy-resolution-measure" className="mb-1 block text-xs font-semibold text-red-700">
+                Lý do xử lý sự cố <span className="text-red-600">*</span>
+              </label>
+              <textarea
+                id="discrepancy-resolution-measure"
+                value={resolutionMeasure}
+                onChange={(event) => onResolutionMeasureChange(event.target.value)}
+                rows={4}
+                maxLength={DISCREPANCY_REASON_MAX_LENGTH + 20}
+                placeholder="Ví dụ: Chênh lệch do hàng rách bao bì, đã kiểm đếm lại tại bin A-04-12 và xác nhận với quản lý ca."
+                className={`w-full rounded-xl border bg-white px-3 py-2 text-sm text-slate-700 outline-none transition ${resolutionError ? 'border-red-300 focus:border-red-500 focus:ring-2 focus:ring-red-100' : 'border-red-200 focus:border-red-400 focus:ring-2 focus:ring-red-100'}`}
+              />
+
+              {resolutionError ? (
+                <div className="mt-1 space-y-0.5">
+                  {validationErrors.map((error) => (
+                    <p key={error} className="text-[11px] text-red-600">{error}</p>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-1 text-[11px] text-slate-500">
+                  Lý do hợp lệ. Còn lại {remainingChars} ký tự.
+                </p>
+              )}
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                onClick={onGoBack}
+                className="flex-1 rounded-xl border border-red-200 bg-white py-3 text-sm font-bold text-red-600 transition-colors hover:bg-red-50"
+                style={{ minHeight: 48 }}
+              >
+                Quay lại chỉnh số lượng
+              </button>
+              <button
+                onClick={onContinue}
+                className="flex-1 rounded-xl bg-red-600 py-3 text-sm font-bold text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                disabled={continueDisabled || resolutionError}
+                style={{ minHeight: 48 }}
+              >
+                Xác nhận xử lý sự cố
+              </button>
+            </div>
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+function CompleteConfirmDialog({
+  open,
+  orderCode,
+  onCancel,
+  onConfirm,
+  isPending,
+}: {
+  open: boolean;
+  orderCode: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+  isPending: boolean;
+}) {
+  if (!open) {
+    return null;
+  }
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      >
+        <button
+          type="button"
+          className="absolute inset-0 bg-black/40"
+          onClick={onCancel}
+          aria-label="Đóng xác nhận hoàn tất"
+        />
+
+        <motion.div
+          initial={{ opacity: 0, scale: 0.96, y: 8 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.96, y: 8 }}
+          className="relative w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl"
+        >
+          <div className="mb-4 flex items-start gap-3">
+            <span className="material-symbols-outlined mt-0.5 text-emerald-600">task_alt</span>
+            <div>
+              <h3 className="text-base font-bold text-slate-900">Xác nhận hoàn tất phiếu</h3>
+              <p className="mt-1 text-sm text-slate-600">
+                Bạn có chắc muốn hoàn tất phiếu <span className="font-semibold">{orderCode}</span>?
+              </p>
+              <p className="mt-1 text-xs text-slate-500">
+                Hệ thống sẽ trừ tồn kho thực tế và đóng phiếu ở trạng thái COMPLETED.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={isPending}
+              className="flex-1 rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+            >
+              Hủy
+            </button>
+            <button
+              type="button"
+              onClick={onConfirm}
+              disabled={isPending}
+              className="flex-1 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-emerald-700 disabled:opacity-60"
+            >
+              {isPending ? 'Đang xử lý...' : 'Xác nhận hoàn tất'}
+            </button>
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
 
 export function OutboundPickingScreen() {
-  const { id: orderId } = useParams<{ id: string }>();
+  const { id: rawId } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const [activeTaskIndex, setActiveTaskIndex] = useState(0);
+  const { toast } = useToast();
 
-  const { data: order } = useOutboundOrder(orderId!);
-  const { data: tasks = [], isLoading, refetch } = usePickingTasks(orderId!);
-  const updatePickedQty = useUpdatePickedQty(orderId!);
-  const transitionStatus = useTransitionOutboundStatus(orderId!);
+  const numericId = parseInt(rawId ?? '0', 10);
+  const { data: order, isLoading, refetch } = useStockOut(numericId);
 
-  // Find first pending task on load
+  const updateLotsMutation = useUpdatePickedLots(numericId);
+  const completeMutation = useCompleteStockOut(numericId);
+
+  // Local state: gán lô cho từng detail
+  const [assignments, setAssignments] = useState<DetailAssignments>(() => ({}));
+  const [isSaving, setIsSaving] = useState(false);
+  const [discrepancyState, setDiscrepancyState] = useState<{
+    visible: boolean;
+    items: StockOutDiscrepancy[];
+    message: string;
+  }>({ visible: false, items: [], message: '' });
+  const [discrepancyResolutionMeasure, setDiscrepancyResolutionMeasure] = useState('');
+  const [isOnline, setIsOnline] = useState(
+    typeof navigator === 'undefined' ? true : navigator.onLine,
+  );
+  const [completeConfirmOpen, setCompleteConfirmOpen] = useState(false);
+
+  const normalizeDiscrepancyReason = useCallback((value: string) => value.replace(/\s+/g, ' ').trim(), []);
+
+  const validateDiscrepancyReason = useCallback(
+    (value: string) => {
+      const normalized = normalizeDiscrepancyReason(value);
+      const errors: string[] = [];
+
+      if (!normalized) {
+        errors.push('Vui lòng nhập lý do xử lý sự cố.');
+      }
+      if (normalized.length > 0 && normalized.length < DISCREPANCY_REASON_MIN_LENGTH) {
+        errors.push(`Lý do phải có tối thiểu ${DISCREPANCY_REASON_MIN_LENGTH} ký tự.`);
+      }
+      if (normalized.length > DISCREPANCY_REASON_MAX_LENGTH) {
+        errors.push(`Lý do không được vượt quá ${DISCREPANCY_REASON_MAX_LENGTH} ký tự.`);
+      }
+      if (normalized.length > 0 && !/[\p{L}\p{N}]/u.test(normalized)) {
+        errors.push('Lý do phải chứa ít nhất 1 chữ hoặc số hợp lệ.');
+      }
+
+      return {
+        normalized,
+        valid: errors.length === 0,
+        errors,
+      };
+    },
+    [normalizeDiscrepancyReason],
+  );
+
   useEffect(() => {
-    const firstPendingIdx = tasks.findIndex((t) => t.status !== 'DONE');
-    if (firstPendingIdx >= 0 && firstPendingIdx !== activeTaskIndex) {
-      setActiveTaskIndex(firstPendingIdx);
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // Khởi tạo assignments từ dữ liệu đã có (lots từ BE khi load)
+  const getDetailAssignments = useCallback(
+    (detail: StockOutDetail): LotAssignment[] => {
+      if (assignments[detail.id]) return assignments[detail.id];
+      // Nếu BE đã có lots, map vào local state
+      if (detail.lots.length > 0) {
+        return detail.lots.map((l) => ({
+          lotValue: l.product_lot?.lot_number?.trim() || String(l.product_lot_id),
+          quantity: l.quantity,
+        }));
+      }
+      // Default: 1 hàng trống
+      return [{ lotValue: '', quantity: 0 }];
+    },
+    [assignments],
+  );
+
+  const handleAssignmentsChange = (detailId: number, lots: LotAssignment[]) => {
+    setAssignments((prev) => ({ ...prev, [detailId]: lots }));
+    // Ẩn discrepancy nếu đang sửa
+    if (discrepancyState.visible) {
+      setDiscrepancyState({ visible: false, items: [], message: '' });
     }
-  }, [tasks, activeTaskIndex]);
+  };
 
-  const completedTasks = tasks.filter((t) => t.status === 'DONE').length;
-  const totalTasks = tasks.length;
-  const progressPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
-  const remainingTasks = totalTasks - completedTasks;
-  const allDone = totalTasks > 0 && completedTasks === totalTasks;
-
-  const activeTask = tasks[activeTaskIndex];
-  const pendingTasks = tasks.filter((t, idx) => idx > activeTaskIndex && t.status !== 'DONE');
-  const nextTask = pendingTasks[0];
-
-  const handleConfirm = async (task: PickingTask, qty: number) => {
-    await updatePickedQty.mutateAsync({
-      lineItemId: task.lineItemId,
-      pickedQty: qty,
+  const openDiscrepancyPanel = (items: StockOutDiscrepancy[], message: string) => {
+    setDiscrepancyState({
+      visible: true,
+      items,
+      message,
     });
+  };
 
-    // Advance to next pending
-    const nextPendingIdx = tasks.findIndex((t, i) => i > activeTaskIndex && t.status !== 'DONE');
-    if (nextPendingIdx >= 0) {
-      setActiveTaskIndex(nextPendingIdx);
+  const details = order?.details ?? [];
+  const outboundLocationId = order?.warehouse_location_id ?? 0;
+
+  const lineStats = useMemo(() => {
+    return details.map((detail) => {
+      const lots = assignments[detail.id] ?? getDetailAssignments(detail);
+      const picked = lots.reduce((sum, lot) => sum + (lot.quantity || 0), 0);
+      const required = Number(detail.quantity) || 0;
+
+      return {
+        detail,
+        picked,
+        required,
+        isEnough: picked === required,
+        isOver: picked > required,
+      };
+    });
+  }, [assignments, details, getDetailAssignments]);
+
+  // Tiến độ theo số dòng đã đủ (theo AC: 1/5 dòng = 20%)
+  const enoughCount = useMemo(
+    () => lineStats.filter((line) => line.isEnough).length,
+    [lineStats],
+  );
+
+  const hasOverAssigned = useMemo(
+    () => lineStats.some((line) => line.isOver),
+    [lineStats],
+  );
+
+  const totalRequired = useMemo(
+    () => lineStats.reduce((sum, line) => sum + line.required, 0),
+    [lineStats],
+  );
+
+  const totalPicked = useMemo(
+    () => lineStats.reduce((sum, line) => sum + line.picked, 0),
+    [lineStats],
+  );
+
+  const hasDiscrepancy = useMemo(
+    () => lineStats.some((line) => line.picked !== line.required),
+    [lineStats],
+  );
+
+  const progressPct = useMemo(() => {
+    if (details.length === 0) return 0;
+    return Math.round((enoughCount / details.length) * 100);
+  }, [details.length, enoughCount]);
+
+  // Kiểm tra discrepancies cục bộ
+  const computeDiscrepancies = (): StockOutDiscrepancy[] => {
+    return details
+      .map((d) => {
+        const lots = assignments[d.id] ?? getDetailAssignments(d);
+        const picked = lots.reduce((s, l) => s + (l.quantity || 0), 0);
+        return {
+          stock_out_detail_id: d.id,
+          product_id: d.product_id,
+          product_name: d.product?.name ?? `SP #${d.product_id}`,
+          product_sku: d.product?.sku ?? '—',
+          required_quantity: d.quantity,
+          picked_quantity: picked,
+          difference: picked - d.quantity,
+        };
+      })
+      .filter((d) => d.difference !== 0);
+  };
+
+  // Xây dựng payload lots
+  const buildLotsPayload = async (): Promise<{
+    payload: PickedLotEntry[];
+    invalidLotValues: string[];
+  }> => {
+    const result: PickedLotEntry[] = [];
+    const invalidLotValues: string[] = [];
+    const lotCodeCache = new Map<string, number | null>();
+
+    const toNumericLotId = (lotValue: string): number | null => {
+      const normalized = lotValue.trim();
+      if (!normalized) {
+        return null;
+      }
+
+      if (/^\d+$/.test(normalized)) {
+        const parsed = Number(normalized);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          return parsed;
+        }
+      }
+
+      return null;
+    };
+
+    for (const detail of details) {
+      const lots = assignments[detail.id] ?? getDetailAssignments(detail);
+      for (const lot of lots) {
+        if (!lot.lotValue.trim() && lot.quantity <= 0) {
+          continue;
+        }
+
+        let numericLotId = toNumericLotId(lot.lotValue);
+
+        if (numericLotId == null) {
+          const normalizedLotCode = lot.lotValue.trim();
+          const cacheKey = `${detail.product_id}:${outboundLocationId}:${normalizedLotCode.toLowerCase()}`;
+
+          if (lotCodeCache.has(cacheKey)) {
+            numericLotId = lotCodeCache.get(cacheKey) ?? null;
+          } else {
+            const resolvedLotId = await resolveProductLotCodeToId(
+              detail.product_id,
+              outboundLocationId,
+              normalizedLotCode,
+            );
+            lotCodeCache.set(cacheKey, resolvedLotId);
+            numericLotId = resolvedLotId;
+          }
+
+          if (numericLotId == null) {
+            invalidLotValues.push(normalizedLotCode);
+            continue;
+          }
+        }
+
+        if (lot.quantity > 0) {
+          result.push({
+            stock_out_detail_id: detail.id,
+            product_lot_id: numericLotId,
+            quantity: lot.quantity,
+          });
+        }
+      }
+    }
+
+    return {
+      payload: result,
+      invalidLotValues,
+    };
+  };
+
+  /** Lưu tất cả lot assignments (PUT /picked-lots) */
+  const handleSaveAssignments = async () => {
+    if (!isOnline) {
+      toast({
+        title: 'Mất kết nối mạng',
+        description: 'Không thể lưu tạm khi đang offline. Vui lòng kiểm tra mạng và thử lại.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    const { payload: lots, invalidLotValues } = await buildLotsPayload();
+
+    if (invalidLotValues.length > 0) {
+      toast({
+        title: 'Không tìm thấy mã lô',
+        description: `Không map được mã lô sang ID trong kho hiện tại: ${invalidLotValues[0]}`,
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    if (lots.length === 0) {
+      toast({
+        title: 'Chưa có lô nào được gán',
+        description: 'Vui lòng nhập mã lô và số lượng cho ít nhất 1 sản phẩm.',
+        variant: 'destructive',
+      });
+      return;
+    }
+    setIsSaving(true);
+    try {
+      await updateLotsMutation.mutateAsync({ lots });
+    } finally {
+      setIsSaving(false);
     }
   };
 
-  const handleComplete = async () => {
-    await transitionStatus.mutateAsync({ newStatus: 'COMPLETED' });
-    navigate(`/outbound/${orderId}`);
+  /** Hoàn tất phiếu xuất (PATCH /complete) */
+  const handleComplete = async (allowDiscrepancy: boolean = false) => {
+    if (!isOnline) {
+      toast({
+        title: 'Mất kết nối mạng',
+        description: 'Không thể hoàn tất phiếu khi đang offline. Vui lòng kiểm tra mạng và thử lại.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    if (hasOverAssigned) {
+      toast({
+        title: 'Số lượng vượt yêu cầu',
+        description: 'Có dòng lô đang vượt số lượng yêu cầu. Vui lòng điều chỉnh trước khi hoàn tất.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    // Kiểm tra discrepancy cục bộ trước
+    const discrepancies = computeDiscrepancies();
+    if (discrepancies.length > 0 && !allowDiscrepancy) {
+      openDiscrepancyPanel(discrepancies, 'Số lượng gán lô chưa khớp với yêu cầu xuất.');
+      return;
+    }
+
+    const reasonValidation = validateDiscrepancyReason(discrepancyResolutionMeasure);
+
+    if (discrepancies.length > 0 && !reasonValidation.valid) {
+      openDiscrepancyPanel(discrepancies, reasonValidation.errors[0] ?? 'Vui lòng nhập lý do xử lý sự cố hợp lệ để tiếp tục.');
+      return;
+    }
+
+    // Lưu lots trước khi complete
+    const { payload: lots, invalidLotValues } = await buildLotsPayload();
+
+    if (invalidLotValues.length > 0) {
+      toast({
+        title: 'Không tìm thấy mã lô',
+        description: `Không map được mã lô sang ID trong kho hiện tại: ${invalidLotValues[0]}`,
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    if (lots.length > 0) {
+      try {
+        await updateLotsMutation.mutateAsync({ lots });
+      } catch {
+        return; // toast đã được xử lý trong hook
+      }
+    }
+
+    try {
+      if (discrepancies.length > 0) {
+        setDiscrepancyResolutionMeasure(reasonValidation.normalized);
+
+        const createdDiscrepancy = await createStockOutDiscrepancy(numericId, {
+          reason: reasonValidation.normalized,
+        });
+
+        const resolvedDiscrepancy = await resolveStockOutDiscrepancy(numericId, createdDiscrepancy.id, {
+          action_taken: reasonValidation.normalized,
+        });
+
+        saveStockOutDiscrepancyResolution({
+          stockOutId: numericId,
+          discrepancyId: createdDiscrepancy.id,
+          reason: createdDiscrepancy.reason,
+          actionTaken: resolvedDiscrepancy.action_taken?.trim() || reasonValidation.normalized,
+          resolvedAt: new Date().toISOString(),
+        });
+      }
+
+      await completeMutation.mutateAsync();
+      navigate('/outbound');
+    } catch (err: unknown) {
+      // BE có thể trả 400 với lỗi số lượng không khớp
+      const message =
+        err instanceof Error ? err.message : 'Không thể hoàn tất phiếu xuất.';
+      const discrepanciesFromBe = computeDiscrepancies();
+      openDiscrepancyPanel(discrepanciesFromBe, message);
+    }
   };
+
+  const isCompleting = completeMutation.isPending;
+  const allFulfilled = details.length > 0 && enoughCount === details.length;
+  const completeButtonLabel = hasDiscrepancy ? 'Xử lý sự cố' : 'Hoàn tất phiếu xuất';
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-full min-h-screen">
-        <div className="flex flex-col items-center gap-3">
-          <div className="w-10 h-10 border-4 border-primary/20 border-t-primary rounded-full animate-spin" />
-          <p className="text-sm text-slate-400">Loading picking tasks...</p>
-        </div>
+      <div className="flex flex-col items-center justify-center min-h-screen gap-3 bg-white">
+        <div className="w-12 h-12 border-4 border-blue-100 border-t-blue-600 rounded-full animate-spin" />
+        <p className="text-sm text-slate-400 font-medium">Đang tải phiếu lấy hàng...</p>
+      </div>
+    );
+  }
+
+  // Access guard — chỉ APPROVED hoặc PICKING mới được vào
+  if (!order || (order.status !== 'APPROVED' && order.status !== 'PICKING')) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen gap-4 bg-white px-6">
+        <span className="material-symbols-outlined text-4xl text-amber-300">lock</span>
+        <h2 className="text-base font-bold text-slate-700 text-center">
+          Phiếu chưa sẵn sàng để lấy hàng
+        </h2>
+        <p className="text-sm text-slate-400 text-center max-w-xs">
+          Chỉ phiếu ở trạng thái <strong>Đã duyệt</strong> hoặc{' '}
+          <strong>Đang lấy hàng</strong> mới có thể thực hiện bước này.
+        </p>
+        <button
+          onClick={() => navigate(`/outbound/${rawId}`)}
+          className="px-6 py-3 bg-blue-600 text-white font-bold rounded-xl text-sm"
+          style={{ minHeight: 48 }}
+        >
+          Về chi tiết phiếu
+        </button>
       </div>
     );
   }
 
   return (
-    <div className="bg-surface text-on-surface min-h-full pb-20">
-      {/* Top Bar */}
-      <header className="sticky top-0 z-30 bg-white dark:bg-slate-900 shadow-sm px-8 py-4 flex justify-between items-center">
-        <div className="flex items-center gap-4">
-          <h1 className="text-xl font-extrabold tracking-tighter text-blue-800 dark:text-blue-200 uppercase font-manrope">OUTBOUND OPERATIONS</h1>
-          <div className="h-6 w-px bg-slate-200"></div>
-          <div className="flex items-center gap-2 text-slate-500">
-            <span className="material-symbols-outlined text-lg cursor-pointer hover:text-primary transition-colors" data-icon="shortcut" onClick={() => navigate(`/outbound/${orderId}`)}>shortcut</span>
-            <span className="text-sm font-medium">Picking Queue / #{order?.code || orderId}</span>
-          </div>
-        </div>
-        <div className="flex items-center gap-6">
-          <div className="relative">
-            <span className="material-symbols-outlined text-slate-500 cursor-pointer" data-icon="notifications">notifications</span>
-            <span className="absolute -top-1 -right-1 w-2 h-2 bg-error rounded-full"></span>
-          </div>
-          <span className="material-symbols-outlined text-slate-500 cursor-pointer" onClick={() => refetch()} data-icon="refresh">refresh</span>
-        </div>
-      </header>
+    <div className="h-full overflow-y-auto bg-slate-50 pb-8">
+      <PickingHeader
+        code={order.code}
+        onBack={() => navigate(`/outbound/${rawId}`)}
+        onRefresh={() => refetch()}
+      />
 
-      <div className="p-8 max-w-7xl mx-auto">
-        
-        {/* Order Progress Header Section */}
-        <section className="mb-8 grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2 bg-surface-container-lowest p-6 rounded-xl shadow-sm border-b-2 border-primary-container/10">
-            <div className="flex justify-between items-end mb-4">
-              <div>
-                <p className="text-on-surface-variant text-sm font-semibold mb-1 uppercase tracking-wider">Picking Progress</p>
-                <h2 className="text-3xl font-extrabold text-primary tracking-tight">{progressPct}% Completed</h2>
-              </div>
-              <div className="text-right">
-                <p className="text-on-surface-variant text-xs mb-1">Expected Completion</p>
-                <p className="text-sm font-bold text-secondary">In 12 minutes</p>
-              </div>
-            </div>
-            <div className="w-full h-3 bg-surface-container rounded-full overflow-hidden">
-              <div 
-                className="h-full bg-gradient-to-r from-primary to-primary-container rounded-full transition-all duration-700 ease-in-out" 
-                style={{ width: `${progressPct}%` }}
-              ></div>
-            </div>
-            <div className="flex justify-between mt-3 text-xs font-medium text-slate-500">
-              <span>{completedTasks} / {totalTasks} Items</span>
-              <span>{remainingTasks} Locations remaining</span>
-            </div>
-          </div>
-          
-          <div className="bg-secondary-container/20 p-6 rounded-xl border border-secondary-container/30 backdrop-blur-md flex flex-col justify-center">
-            <div className="flex items-center gap-3 mb-2">
-              <span className="material-symbols-outlined text-secondary" data-icon="auto_awesome">auto_awesome</span>
-              <p className="text-secondary font-bold text-sm">AI Route Optimization</p>
-            </div>
-            <p className="text-on-secondary-container text-xs leading-relaxed mb-4">
-              Route optimized using <b>S-Shape picking</b> method to reduce travel distance by 22%.
+      <div className="mx-auto max-w-7xl space-y-6 px-4 py-6 md:px-6">
+        <section className="grid grid-cols-1 gap-4 md:grid-cols-[1fr_320px] md:items-end">
+          <div>
+            <h1 className="font-headline text-2xl font-extrabold tracking-tight text-slate-900 md:text-3xl">
+              Tác nghiệp lấy hàng
+            </h1>
+            <p className="mt-1 flex items-center gap-2 text-sm text-slate-500">
+              <span className="material-symbols-outlined text-[18px]">receipt_long</span>
+              Mã chứng từ: <span className="font-semibold text-slate-800">{order.code}</span>
             </p>
-            <div className="flex flex-wrap items-center gap-2">
-              {Array.from(new Set(tasks.map((t) => t.aisle).filter(Boolean))).map((aisle, i, arr) => (
-                <div key={aisle} className="flex items-center">
-                  <div className="px-2 py-1 bg-white/60 rounded-lg text-[10px] font-bold text-secondary uppercase tracking-tighter shadow-sm border border-secondary/10">
-                    Aisle {aisle}
-                  </div>
-                  {i < arr.length - 1 && (
-                    <span className="material-symbols-outlined text-[12px] text-secondary/60 mx-1" data-icon="trending_flat">trending_flat</span>
-                  )}
-                </div>
-              ))}
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Tiến độ đợt lấy hàng</span>
+              <span className="font-headline text-lg font-extrabold text-secondary">{progressPct}%</span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100">
+              <div
+                className="h-full rounded-full bg-secondary transition-all duration-300"
+                style={{ width: `${progressPct}%` }}
+              />
             </div>
           </div>
         </section>
 
-        {allDone ? (
-          <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-8 text-center max-w-2xl mx-auto shadow-sm">
-            <span className="material-symbols-outlined text-6xl text-emerald-500 mb-4 block" data-icon="check_circle" style={{ fontVariationSettings: "'FILL' 1" }}>
-              check_circle
-            </span>
-            <h3 className="text-2xl font-bold text-emerald-800 mb-2">
-              All {totalTasks} lines completed!
-            </h3>
-            <p className="text-emerald-700 mb-8">All items have been picked securely. You may finalize the shipment.</p>
-            <button
-              onClick={handleComplete}
-              disabled={transitionStatus.isPending}
-              className="px-10 py-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-black text-sm uppercase tracking-widest transition-all active:scale-95 shadow-lg shadow-emerald-600/30 disabled:opacity-60"
-            >
-              {transitionStatus.isPending ? (
-                <span className="flex items-center gap-3 justify-center">
-                  <span className="w-5 h-5 border-2 border-white/40 border-t-white rounded-full animate-spin" />
-                  Processing...
+        <section className="rounded-xl bg-primary-container p-5 text-white shadow-sm md:p-7">
+          <div className="flex flex-col items-start justify-between gap-4 md:flex-row md:items-center">
+            <div className="flex items-center gap-4">
+              <div className="rounded-full bg-white/15 p-3">
+                <span className="material-symbols-outlined text-3xl" style={{ fontVariationSettings: "'FILL' 1" }}>
+                  location_on
                 </span>
-              ) : (
-                '✓ Complete Order'
-              )}
-            </button>
-          </div>
-        ) : (
-          <section className="space-y-4">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-bold text-on-surface flex items-center gap-2">
-                <span className="material-symbols-outlined text-primary" data-icon="list_alt">list_alt</span>
-                Locations to Pick
-              </h3>
-              <div className="flex gap-2">
-                <button className="px-4 py-2 text-xs font-bold rounded-lg bg-surface-container-high text-on-surface-variant flex items-center gap-2 hover:bg-slate-200 transition-colors">
-                  <span className="material-symbols-outlined text-sm" data-icon="filter_list">filter_list</span>
-                  Sort: Optimized
-                </button>
+              </div>
+              <div>
+                <h2 className="font-headline text-2xl font-extrabold tracking-tight md:text-4xl">
+                  Bin {order.location?.code ?? `LOC-${order.warehouse_location_id}`}
+                </h2>
+                <p className="mt-1 text-sm text-white/85">Vị trí gợi ý ưu tiên lấy hàng tiếp theo</p>
               </div>
             </div>
+            <span className="rounded-lg bg-white/15 px-4 py-2 text-sm font-semibold">
+              Khu vực: {order.location?.name ?? `#${order.warehouse_location_id}`}
+            </span>
+          </div>
+        </section>
 
-            {/* Active Task (Currently Picking) */}
-            {activeTask && (
-              <div className="relative bg-white rounded-xl shadow-lg border-2 border-primary-container overflow-hidden group mb-6">
-                <div className="absolute left-0 top-0 bottom-0 w-2 bg-primary"></div>
-                <div className="p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
-                  <div className="flex items-center gap-6">
-                    <div className="bg-primary-container text-white w-20 h-20 rounded-xl flex flex-col items-center justify-center shrink-0 shadow-inner">
-                      <span className="text-[10px] uppercase font-bold opacity-80">Location</span>
-                      <span className="text-2xl font-black">{activeTask.locationCode}</span>
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="px-2 py-0.5 bg-secondary-container text-on-secondary-container text-[10px] font-bold rounded uppercase">
-                          Zone {activeTask.aisle || 'General'}
-                        </span>
-                        <span className="text-xs font-medium text-slate-400">SKU: {activeTask.productCode}</span>
-                      </div>
-                      <h4 className="text-xl font-bold text-on-surface">{activeTask.productName}</h4>
-                      <div className="mt-2 flex items-center gap-4">
-                        <div className="flex items-center gap-1 text-on-surface-variant bg-slate-50 px-2 py-1 rounded-md">
-                          <span className="material-symbols-outlined text-sm" data-icon="layers">layers</span>
-                          <span className="text-sm font-semibold">Level: {activeTask.level || 1}</span>
-                        </div>
-                        {activeTask.lotNumber && (
-                          <div className="flex items-center gap-1 text-on-surface-variant bg-slate-50 px-2 py-1 rounded-md mb-1">
-                            <span className="material-symbols-outlined text-sm" data-icon="inventory_2">inventory_2</span>
-                            <span className="text-sm font-semibold">Lot: {activeTask.lotNumber}</span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
+        {!isOnline && (
+          <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-800 shadow-sm">
+            Đang offline. Các thao tác Lưu và Hoàn tất đã bị khóa để tránh mất dữ liệu.
+          </div>
+        )}
+
+        {hasOverAssigned && (
+          <div className="rounded-lg border border-tertiary-fixed-dim bg-tertiary-fixed p-4 text-sm text-tertiary shadow-sm">
+            Tổng số lượng thực tế đang vượt yêu cầu ở ít nhất một dòng. Vui lòng điều chỉnh trước khi hoàn tất.
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
+          <aside className="space-y-4 xl:sticky xl:top-24 xl:self-start">
+            <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+              <h3 className="font-headline text-lg font-bold text-slate-900">Tổng quan đợt lấy hàng</h3>
+              <div className="mt-4 grid grid-cols-3 gap-2">
+                {[
+                  { label: 'Tổng SP', value: details.length, color: 'text-slate-800' },
+                  { label: 'Đã đủ', value: enoughCount, color: 'text-emerald-600' },
+                  { label: 'Tổng lấy', value: totalPicked, color: 'text-[#0052cc]' },
+                ].map((item) => (
+                  <div key={item.label} className="rounded-lg bg-slate-50 p-3 text-center">
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">{item.label}</p>
+                    <p className={`mt-1 text-lg font-extrabold ${item.color}`}>{item.value}</p>
                   </div>
-                  
-                  <div className="flex items-center gap-8 w-full md:w-auto border-t md:border-t-0 pt-4 md:pt-0">
-                    <div className="text-center">
-                      <p className="text-[10px] uppercase font-bold text-slate-400 mb-1">Quantity</p>
-                      <p className="text-4xl font-black text-primary ml-1">{String(activeTask.requestedQty).padStart(2, '0')}</p>
-                    </div>
-                    <button 
-                      onClick={() => handleConfirm(activeTask, activeTask.requestedQty)}
-                      disabled={updatePickedQty.isPending}
-                      className="flex-1 md:flex-none bg-primary hover:bg-primary-container text-white px-8 py-4 rounded-xl font-black text-sm uppercase tracking-widest transition-all active:scale-95 shadow-md shadow-primary/20 flex items-center justify-center gap-3 disabled:opacity-70 disabled:cursor-not-allowed"
-                    >
-                      {updatePickedQty.isPending ? (
-                        <span className="w-5 h-5 border-2 border-white/40 border-t-white rounded-full animate-spin" />
-                      ) : (
-                        <span className="material-symbols-outlined text-xl" data-icon="check_circle" style={{ fontVariationSettings: "'FILL' 1" }}>check_circle</span>
-                      )}
-                      Confirm Pick
-                    </button>
-                  </div>
-                </div>
-                
-                {/* Visual Hint for next location */}
-                {nextTask && (
-                  <div className="bg-surface-container-low px-6 py-2 flex items-center gap-3 text-xs border-t border-slate-100">
-                    <span className="text-slate-400 font-bold uppercase tracking-tighter">Next Up:</span>
-                    <span className="text-secondary font-bold">{nextTask.locationCode} (Nearby)</span>
-                    <span className="material-symbols-outlined text-sm text-secondary" data-icon="trending_flat">trending_flat</span>
+                ))}
+              </div>
+              <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+                Yêu cầu tổng: <span className="font-bold text-slate-900">{totalRequired}</span>
+              </div>
+            </div>
+          </aside>
+
+          <section className="space-y-4 xl:col-span-2">
+            <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+              <p className="mb-3 text-xs font-bold uppercase tracking-wider text-slate-500">Danh sách gán lô hàng</p>
+              <div className="space-y-3">
+                {details.map((detail, i) => (
+                  <DetailCard
+                    key={detail.id}
+                    detail={detail}
+                    assignments={assignments[detail.id] ?? getDetailAssignments(detail)}
+                    onAssignmentsChange={(lots) => handleAssignmentsChange(detail.id, lots)}
+                    idx={i}
+                  />
+                ))}
+                {details.length === 0 && (
+                  <div className="py-10 text-center text-sm text-slate-400">
+                    <span className="material-symbols-outlined mb-1 block text-2xl">inventory_2</span>
+                    Phiếu này chưa có sản phẩm.
                   </div>
                 )}
               </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleSaveAssignments}
+              disabled={isSaving || updateLotsMutation.isPending || !isOnline}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white py-3 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:bg-slate-50 disabled:opacity-60"
+              style={{ minHeight: 52 }}
+            >
+              {isSaving || updateLotsMutation.isPending ? (
+                <span className="h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-slate-700" />
+              ) : (
+                <span className="material-symbols-outlined text-[20px]">save</span>
+              )}
+              Lưu gán lô tạm thời
+            </button>
+          </section>
+        </div>
+      </div>
+
+      {/* ── Sticky footer: Complete button ───────────────────────────────────── */}
+      <div className="sticky bottom-0 z-20 border-t border-slate-100 bg-white/95 px-4 py-4 shadow-xl backdrop-blur safe-area-bottom">
+        <div className="mx-auto max-w-3xl space-y-2">
+          {!allFulfilled && (
+            <p className="text-center text-xs text-amber-600 font-medium flex items-center justify-center gap-1">
+              <span className="material-symbols-outlined text-[14px]">warning</span>
+              Một số sản phẩm chưa đủ số lượng. Kiểm tra lại trước khi hoàn tất.
+            </p>
+          )}
+          {hasOverAssigned && (
+            <p className="text-center text-xs text-red-600 font-medium flex items-center justify-center gap-1">
+              <span className="material-symbols-outlined text-[14px]">error</span>
+              Có dòng đang vượt số lượng yêu cầu. Vui lòng giảm số lượng để tiếp tục.
+            </p>
+          )}
+          <motion.button
+            type="button"
+            onClick={() => {
+              if (hasDiscrepancy) {
+                const discrepancies = computeDiscrepancies();
+                openDiscrepancyPanel(discrepancies, 'Phát hiện chênh lệch số lượng. Vui lòng nhập lý do trước khi xuất.');
+                return;
+              }
+              setCompleteConfirmOpen(true);
+            }}
+            disabled={isCompleting || details.length === 0 || hasOverAssigned || !isOnline}
+            whileTap={{ scale: 0.97 }}
+            className={`w-full flex items-center justify-center gap-3 font-extrabold rounded-2xl text-base transition-all disabled:opacity-60 ${hasDiscrepancy
+              ? 'bg-red-600 hover:bg-red-700 text-white shadow-lg shadow-red-600/30'
+              : allFulfilled
+                ? 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-lg shadow-emerald-600/30'
+                : 'bg-blue-600 hover:bg-blue-700 text-white shadow-lg shadow-blue-600/30'
+              }`}
+            style={{ minHeight: 56 }}
+          >
+            {isCompleting ? (
+              <>
+                <span className="w-5 h-5 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                Đang hoàn tất...
+              </>
+            ) : hasDiscrepancy ? (
+              <>
+                <span className="material-symbols-outlined text-[22px]">report</span>
+                {completeButtonLabel}
+              </>
+            ) : allFulfilled ? (
+              <>
+                <span className="material-symbols-outlined text-[22px]" style={{ fontVariationSettings: "'FILL' 1" }}>
+                  check_circle
+                </span>
+                {completeButtonLabel}
+              </>
+            ) : (
+              <>
+                <span className="material-symbols-outlined text-[22px]">local_shipping</span>
+                Hoàn tất (có sự cố)
+              </>
             )}
-
-            {/* Next Tasks (Tonal Representation) */}
-            <div className="grid grid-cols-1 gap-3">
-              {pendingTasks.map((task) => (
-                <div key={task.id} className="bg-surface-container-lowest p-5 rounded-xl flex items-center justify-between border-l-4 border-slate-300 shadow-sm hover:border-primary/40 transition-colors">
-                  <div className="flex items-center gap-5">
-                    <div className="w-14 h-14 bg-white rounded-lg flex flex-col items-center justify-center border border-slate-200 shadow-sm shrink-0">
-                      <span className="text-[8px] uppercase font-bold text-slate-400">Location</span>
-                      <span className="text-lg font-bold text-slate-700 leading-tight">{task.locationCode}</span>
-                    </div>
-                    <div>
-                      <h4 className="font-bold text-on-surface line-clamp-1">{task.productName}</h4>
-                      <p className="text-xs text-slate-500 mt-1">SKU: {task.productCode} • Level: {task.level || 1}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-6">
-                    <div className="text-right">
-                      <p className="text-[8px] uppercase font-bold text-slate-400">QTY</p>
-                      <p className="text-xl font-bold text-on-surface">{String(task.requestedQty).padStart(2, '0')}</p>
-                    </div>
-                    <button className="p-2 text-slate-400 hover:text-primary transition-colors hover:bg-slate-50 rounded-lg">
-                      <span className="material-symbols-outlined" data-icon="more_vert">more_vert</span>
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
-        )}
-
-        {/* Bottom Status Grid (Bento Style) */}
-        {!allDone && (
-          <section className="mt-8 grid grid-cols-1 md:grid-cols-4 gap-4">
-            <div className="md:col-span-1 bg-white p-4 rounded-xl shadow-sm border border-slate-100 flex flex-col justify-center">
-              <p className="text-[10px] font-bold text-slate-400 uppercase mb-2 tracking-widest">Completed</p>
-              <div className="flex items-baseline gap-2">
-                <span className="text-2xl font-black text-on-surface">{completedTasks}</span>
-                <span className="text-sm font-bold text-slate-400">/ {totalTasks} SKU</span>
-              </div>
-            </div>
-            
-            <div className="md:col-span-1 bg-white p-4 rounded-xl shadow-sm border border-slate-100 flex flex-col justify-center">
-              <p className="text-[10px] font-bold text-slate-400 uppercase mb-2 tracking-widest">Shipping Carton</p>
-              <div className="flex items-center gap-2 text-secondary">
-                <span className="material-symbols-outlined text-xl" data-icon="shopping_basket">shopping_basket</span>
-                <span className="text-lg font-bold text-on-surface">BOX-A2</span>
-              </div>
-            </div>
-            
-            <div className="md:col-span-2 bg-gradient-to-br from-primary to-blue-900 p-5 rounded-xl shadow-lg flex items-center justify-between text-white border border-primary-container">
-              <div>
-                <p className="text-[10px] font-bold opacity-70 uppercase mb-1 tracking-widest">Outbound Order</p>
-                <p className="text-lg font-bold">{order?.priority === 'URGENT' ? 'Priority: Urgent' : 'Priority: High (Lazada Express)'}</p>
-              </div>
-              <div className="w-12 h-12 rounded-full bg-white/10 flex items-center justify-center">
-                <span className="material-symbols-outlined text-3xl opacity-90 text-amber-300" data-icon="bolt" style={{ fontVariationSettings: "'FILL' 1" }}>bolt</span>
-              </div>
-            </div>
-          </section>
-        )}
+          </motion.button>
+        </div>
       </div>
 
-      {/* Contextual Floating Action Buttons */}
-      <div className="fixed bottom-8 right-8 flex flex-col gap-3">
-        <button 
-          onClick={() => navigate(`/outbound/${orderId}`)}
-          className="w-14 h-14 bg-white text-primary rounded-full shadow-lg flex items-center justify-center hover:scale-105 active:scale-95 transition-all border border-slate-100"
-          title="Warehouse Map"
-        >
-          <span className="material-symbols-outlined text-xl" data-icon="map">map</span>
-        </button>
-        <button className="w-16 h-16 bg-primary text-white rounded-full shadow-2xl flex items-center justify-center hover:scale-105 active:scale-95 transition-all shadow-primary/30">
-          <span className="material-symbols-outlined text-3xl" data-icon="qr_code_scanner">qr_code_scanner</span>
-        </button>
-      </div>
+      <DiscrepancyPanel
+        open={discrepancyState.visible}
+        discrepancies={discrepancyState.items}
+        errorMessage={discrepancyState.message}
+        onGoBack={() => setDiscrepancyState({ visible: false, items: [], message: '' })}
+        resolutionMeasure={discrepancyResolutionMeasure}
+        onResolutionMeasureChange={setDiscrepancyResolutionMeasure}
+        onContinue={() => {
+          void handleComplete(true);
+        }}
+        continueDisabled={isCompleting}
+      />
+
+      <CompleteConfirmDialog
+        open={completeConfirmOpen}
+        orderCode={order.code}
+        isPending={isCompleting}
+        onCancel={() => setCompleteConfirmOpen(false)}
+        onConfirm={() => {
+          setCompleteConfirmOpen(false);
+          void handleComplete(false);
+        }}
+      />
     </div>
   );
 }

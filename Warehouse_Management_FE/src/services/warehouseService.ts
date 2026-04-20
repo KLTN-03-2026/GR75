@@ -27,7 +27,9 @@ interface PaginationApiModel {
   page: number;
   limit: number;
   total: number;
-  totalPages: number;
+  total_pages: number;
+  // legacy alias — some endpoints return camelCase
+  totalPages?: number;
 }
 
 interface WarehouseApiItem {
@@ -110,15 +112,27 @@ interface InventoryApiItem {
   quantity: number;
   reserved_quantity: number;
   available_quantity: number;
+  product_uom_id?: number;
   product?: {
     id: number;
     code: string;
     name: string;
   };
+  lot?: {
+    id: number;
+    lot_no: string;
+  } | null;
+  lot_id?: number | null;
+  uom?: {
+    id?: number;
+    uom?: { code: string; name: string };
+    name?: string;
+  } | null;
 }
 
 interface InventoryListApiData {
-  inventories: InventoryApiItem[];
+  inventories?: InventoryApiItem[];
+  items?: InventoryApiItem[];
   pagination: PaginationApiModel;
 }
 
@@ -253,6 +267,8 @@ interface BinAssignmentValue {
   categoryId?: string;
   productId: string;
   productName: string;
+  /** Tải trọng hiện tại (số lượng) của bin — dùng làm fallback tồn kho cho module xuất kho */
+  currentLoad?: number;
 }
 
 interface ZoneCoordinate {
@@ -263,6 +279,9 @@ interface ZoneCoordinate {
 
 const WAREHOUSE_CATEGORY_SCOPE_KEY = 'wm:warehouse-category-scope';
 const ZONE_METADATA_SCOPE_KEY = 'wm:zone-metadata-scope';
+const BIN_ASSIGNMENT_SCOPE_KEY = 'wm:bin-assignment-scope';
+
+let inventoryApiUnavailableUntil = 0;
 
 interface ZoneMetadataFallback {
   name: string;
@@ -358,6 +377,99 @@ function removeZoneMetadataFallback(warehouseId: string, zoneCode: string): void
   writeStorageMap(ZONE_METADATA_SCOPE_KEY, map);
 }
 
+function getBinAssignmentFallbackMap(): Record<string, BinAssignmentValue> {
+  const map = readStorageMap<BinAssignmentValue>(BIN_ASSIGNMENT_SCOPE_KEY);
+  const result: Record<string, BinAssignmentValue> = {};
+
+  Object.entries(map).forEach(([locationId, value]) => {
+    if (!value || typeof value !== 'object') {
+      return;
+    }
+
+    const productId = typeof value.productId === 'string' ? value.productId.trim() : '';
+    if (!productId) {
+      return;
+    }
+
+    const productName = typeof value.productName === 'string' && value.productName.trim().length > 0
+      ? value.productName.trim()
+      : `Product #${productId}`;
+
+    const categoryId = typeof value.categoryId === 'string' && value.categoryId.trim().length > 0
+      ? value.categoryId.trim()
+      : undefined;
+
+    const currentLoad = typeof value.currentLoad === 'number' && value.currentLoad >= 0
+      ? value.currentLoad
+      : undefined;
+
+    result[locationId] = {
+      categoryId,
+      productId,
+      productName,
+      currentLoad,
+    };
+  });
+
+  return result;
+}
+
+function setBinAssignmentFallback(locationId: string, value: BinAssignmentValue): void {
+  const next = readStorageMap<BinAssignmentValue>(BIN_ASSIGNMENT_SCOPE_KEY);
+  next[locationId] = {
+    categoryId: value.categoryId,
+    productId: value.productId,
+    productName: value.productName,
+    currentLoad: value.currentLoad,
+  };
+  writeStorageMap(BIN_ASSIGNMENT_SCOPE_KEY, next);
+}
+
+/**
+ * Tính tổng currentLoad của một sản phẩm từ tất cả bin đã lưu trong localStorage.
+ * Fallback synchronous — không phụ thuộc vào API khi /api/inventories chưa phản ánh
+ * đúng dữ liệu sau khi operator cập nhật bin trong Zone Detail.
+ */
+export function getProductAvailableQtyFromBinFallback(productId: string): number {
+  const map = getBinAssignmentFallbackMap();
+  let total = 0;
+  Object.values(map).forEach((assignment) => {
+    if (assignment.productId === productId && typeof assignment.currentLoad === 'number') {
+      total += Math.max(0, assignment.currentLoad);
+    }
+  });
+  return total;
+}
+
+/**
+ * Chọn location có currentLoad cao nhất cho product từ localStorage fallback.
+ * Dùng để suy ra warehouse_location_id khi API inventories tạm thời chưa trả row.
+ */
+export function getProductPreferredLocationIdFromBinFallback(productId: string): number | null {
+  const map = getBinAssignmentFallbackMap();
+  let selectedLocationId: number | null = null;
+  let maxLoad = -1;
+
+  Object.entries(map).forEach(([locationId, assignment]) => {
+    if (assignment.productId !== productId || typeof assignment.currentLoad !== 'number') {
+      return;
+    }
+
+    const normalizedLoad = Math.max(0, assignment.currentLoad);
+    const parsedLocationId = Number(locationId);
+    if (!Number.isFinite(parsedLocationId) || parsedLocationId <= 0) {
+      return;
+    }
+
+    if (normalizedLoad > maxLoad) {
+      maxLoad = normalizedLoad;
+      selectedLocationId = parsedLocationId;
+    }
+  });
+
+  return selectedLocationId;
+}
+
 function buildZoneCoordinatesByStructure(racks: number, levels: number, bins: number): ZoneCoordinate[] {
   const coordinates: ZoneCoordinate[] = [];
 
@@ -449,7 +561,7 @@ async function fetchAllLocationAllowedCategories(params?: {
 
     const payload = unwrapApiData<LocationAllowedCategoryListApiData>(response);
     all.push(...payload.locationAllowedCategories);
-    totalPages = payload.pagination.totalPages;
+    totalPages = payload.pagination.total_pages ?? payload.pagination.totalPages ?? 1;
     page += 1;
   }
 
@@ -463,23 +575,35 @@ async function fetchAllInventories(params?: {
   let page = 1;
   let totalPages = 1;
 
-  while (page <= totalPages) {
-    const response = await apiClient.get<ApiResponse<InventoryListApiData>>('/api/inventories', {
-      params: {
-        page,
-        limit: 100,
-        warehouse_location_id: params?.warehouseLocationId ? Number(params.warehouseLocationId) : undefined,
-      },
-    });
+  if (Date.now() < inventoryApiUnavailableUntil) {
+    return [];
+  }
 
-    const payload = unwrapApiData<InventoryListApiData>(response);
-    all.push(...payload.inventories);
-    totalPages = payload.pagination.totalPages;
-    page += 1;
+  try {
+    while (page <= totalPages) {
+      const response = await apiClient.get<ApiResponse<InventoryListApiData>>('/api/inventories', {
+        params: {
+          page,
+          limit: 100,
+          warehouse_location_id: params?.warehouseLocationId ? Number(params.warehouseLocationId) : undefined,
+        },
+      });
+
+      const payload = unwrapApiData<InventoryListApiData>(response);
+      const records = payload.items ?? payload.inventories ?? [];
+      all.push(...records);
+      totalPages = payload.pagination.total_pages ?? payload.pagination.totalPages ?? 1;
+      page += 1;
+    }
+  } catch {
+    // /api/inventories chưa sẵn sàng — tắt tạm 5 phút để tránh spam lỗi trong UI flow.
+    inventoryApiUnavailableUntil = Date.now() + 5 * 60 * 1000;
+    return [];
   }
 
   return all;
 }
+
 
 function buildLocationAllowedCategoryMap(
   rules: LocationAllowedCategoryApiItem[],
@@ -529,6 +653,23 @@ function buildInventoryAssignmentMap(
     };
   });
 
+  const fallbackMap = getBinAssignmentFallbackMap();
+  Object.entries(fallbackMap).forEach(([locationId, assignment]) => {
+    const existing = map[locationId];
+    if (existing) {
+      if (!existing.categoryId) {
+        existing.categoryId = assignment.categoryId ?? locationCategoryMap[locationId]?.[0];
+      }
+      return;
+    }
+
+    map[locationId] = {
+      categoryId: assignment.categoryId ?? locationCategoryMap[locationId]?.[0],
+      productId: assignment.productId,
+      productName: assignment.productName,
+    };
+  });
+
   return map;
 }
 
@@ -572,17 +713,24 @@ async function fetchLocationsByZoneCode(
   zoneCode: string,
   includeInactive = true,
 ): Promise<WarehouseLocationItem[]> {
-  const response = await apiClient.get<ApiResponse<WarehouseLocationListApiData>>('/api/warehouses/locations/search', {
-    params: {
-      page: 1,
-      limit: 1000,
-      warehouse_id: Number(warehouseId),
-      zone_code: zoneCodeKey(zoneCode),
+  const all = await collectPaginatedItems({
+    fetchPage: async (page, limit) => {
+      const response = await apiClient.get<ApiResponse<WarehouseLocationListApiData>>('/api/warehouses/locations/search', {
+        params: {
+          page,
+          limit,
+          warehouse_id: Number(warehouseId),
+          zone_code: zoneCodeKey(zoneCode),
+        },
+      });
+
+      return unwrapApiData<WarehouseLocationListApiData>(response);
     },
+    getItems: (payload) => payload.locations.map(mapLocation),
+    getTotalPages: (payload) => payload.pagination.total_pages ?? payload.pagination.totalPages ?? 1,
   });
 
-  const payload = unwrapApiData<WarehouseLocationListApiData>(response);
-  const mapped = payload.locations.map(mapLocation);
+  const mapped = all;
   if (includeInactive) {
     return mapped;
   }
@@ -939,12 +1087,21 @@ export async function updateWarehouseLocation(
   id: string,
   payload: WarehouseLocationFormValues,
 ): Promise<WarehouseLocationItem> {
-  const response = await apiClient.patch<ApiResponse<WarehouseLocationApiItem>>(`/api/warehouses/locations/${Number(id)}`, {
-    location_status: mapLocationStatusForRequest(payload.status),
-    is_active: payload.status !== 'inactive',
-    max_weight: payload.capacity,
-    current_weight: payload.currentLoad,
-  });
+  // Only send location_status when explicitly switching to/from MAINTENANCE (blocked).
+  // For 'active' locations, omit the field so BE retains its inventory-calculated
+  // PARTIAL or FULL status instead of being overwritten with AVAILABLE.
+  const locationStatusOverride: Partial<{ location_status: WarehouseLocationApiItem['location_status'] }> =
+    payload.status === 'blocked' ? { location_status: 'MAINTENANCE' } : {};
+
+  const response = await apiClient.patch<ApiResponse<WarehouseLocationApiItem>>(
+    `/api/warehouses/locations/${Number(id)}`,
+    {
+      ...locationStatusOverride,
+      is_active: payload.status !== 'inactive',
+      max_weight: payload.capacity,
+      current_weight: payload.currentLoad,
+    },
+  );
 
   return mapLocation(unwrapApiData<WarehouseLocationApiItem>(response));
 }
@@ -1165,10 +1322,35 @@ export async function updateWarehouseZone(
       .filter((location) => location.rack.trim() && location.level.trim() && location.bin.trim())
       .map((location) => [buildCoordinateKey(location), location]),
   );
+  const existingByLocationCode = new Map(
+    zoneLocations.map((location) => [location.code.trim().toUpperCase(), location]),
+  );
 
-  const upsertRequests = desiredCoordinates.map((coordinate) => {
+  const resolveExistingLocationForCoordinate = (
+    coordinate: ZoneCoordinate,
+    allLocations: WarehouseLocationItem[],
+  ): WarehouseLocationItem | undefined => {
     const key = buildCoordinateKeyFromCodes(coordinate);
-    const existingLocation = existingMap.get(key);
+    const byCoordinate = allLocations.find((location) => buildCoordinateKey(location) === key);
+    if (byCoordinate) {
+      return byCoordinate;
+    }
+
+    const warehouseCode = warehouse?.code?.trim().toUpperCase();
+    if (!warehouseCode) {
+      return undefined;
+    }
+
+    const expectedLocationCode = `${warehouseCode}-${currentZoneCode}-${coordinate.rackCode}-${coordinate.levelCode}-${coordinate.binCode}`;
+    return allLocations.find((location) => location.code.trim().toUpperCase() === expectedLocationCode);
+  };
+
+  const upsertRequests = desiredCoordinates.map(async (coordinate) => {
+    const key = buildCoordinateKeyFromCodes(coordinate);
+    const desiredLocationCode = buildLocationCodeFromCoordinate(warehouseId, currentZoneCode, coordinate)
+      .trim()
+      .toUpperCase();
+    const existingLocation = existingMap.get(key) ?? existingByLocationCode.get(desiredLocationCode);
 
     if (existingLocation) {
       const normalizedWeight = normalizeWeightForLocationUpdate(existingLocation.currentLoad, existingLocation.capacity);
@@ -1183,18 +1365,42 @@ export async function updateWarehouseZone(
       });
     }
 
-    return apiClient.post<ApiResponse<WarehouseLocationApiItem>>('/api/warehouses/locations', {
-      warehouse_id: Number(warehouseId),
-      location_code: `${buildLocationCodeFromCoordinate(warehouseId, currentZoneCode, coordinate)}-${Date.now().toString().slice(-5)}`,
-      zone_code: currentZoneCode,
-      rack_code: coordinate.rackCode,
-      level_code: coordinate.levelCode,
-      bin_code: coordinate.binCode,
-      location_status: 'AVAILABLE',
-      is_active: true,
-      max_weight: 100,
-      storage_condition: normalizedType,
-    });
+    try {
+      return await apiClient.post<ApiResponse<WarehouseLocationApiItem>>('/api/warehouses/locations', {
+        warehouse_id: Number(warehouseId),
+        location_code: desiredLocationCode,
+        zone_code: currentZoneCode,
+        rack_code: coordinate.rackCode,
+        level_code: coordinate.levelCode,
+        bin_code: coordinate.binCode,
+        location_status: 'AVAILABLE',
+        is_active: true,
+        max_weight: 100,
+        storage_condition: normalizedType,
+      });
+    } catch (error) {
+      const responseStatus = (error as { response?: { status?: number } })?.response?.status;
+      if (responseStatus !== 400) {
+        throw error;
+      }
+
+      const refreshedLocations = await fetchLocationsByZoneCode(warehouseId, currentZoneCode, true);
+      const resolvedLocation = resolveExistingLocationForCoordinate(coordinate, refreshedLocations);
+      if (!resolvedLocation) {
+        throw error;
+      }
+
+      const normalizedWeight = normalizeWeightForLocationUpdate(resolvedLocation.currentLoad, resolvedLocation.capacity);
+      return apiClient.patch<ApiResponse<WarehouseLocationApiItem>>(`/api/warehouses/locations/${Number(resolvedLocation.id)}`, {
+        is_active: true,
+        location_status: deriveLocationStatus(normalizedWeight.currentWeight, normalizedWeight.maxWeight),
+        storage_condition: normalizedType,
+        max_weight: normalizedWeight.maxWeight,
+        current_weight: normalizedWeight.currentWeight,
+        max_volume: null,
+        current_volume: 0,
+      });
+    }
   });
 
   const softDeleteRequests = zoneLocations
@@ -1373,14 +1579,11 @@ export async function updateZoneBinCapacity(
     throw new Error('Không thể cập nhật bin vì id vị trí kho không hợp lệ.');
   }
 
-  const hubs = await getWarehouseHubs();
-  const warehouse = hubs.find((item) => item.id === warehouseId);
-  const zone = warehouse?.zones.find((item) => item.id === zoneId);
-  if (!warehouse || !zone) {
-    throw new Error('Không tìm thấy zone để gán danh mục và sản phẩm cho ô lưu trữ.');
-  }
-
-  if (!zone.allowedCategoryIds.includes(payload.categoryId)) {
+  const existingRules = await fetchAllLocationAllowedCategories({ locationId });
+  const allowedCategoryIds = normalizeIdList(
+    existingRules.filter((rule) => rule.is_allowed).map((rule) => String(rule.category_id)),
+  );
+  if (allowedCategoryIds.length > 0 && !allowedCategoryIds.includes(payload.categoryId)) {
     throw new Error('Danh mục của ô lưu trữ phải nằm trong phạm vi danh mục đã cấu hình cho zone.');
   }
 
@@ -1390,39 +1593,26 @@ export async function updateZoneBinCapacity(
     throw new Error('Sản phẩm được chọn không thuộc danh mục hợp lệ của zone.');
   }
 
-  const inventoriesAtLocation = await fetchAllInventories({ warehouseLocationId: locationId });
-  const conflictingInventory = inventoriesAtLocation.find((item) => String(item.product_id) !== payload.productId);
-  if (conflictingInventory) {
-    throw new Error('Mỗi ô/bin chỉ được chứa 1 SKU tại một thời điểm. Ô này đang có SKU khác.');
-  }
-
   const response = await apiClient.patch<ApiResponse<WarehouseLocationApiItem>>(
     `/api/warehouses/locations/${Number(locationId)}`,
     {
       max_weight: payload.capacity,
-      current_weight: payload.currentLoad,
       location_status: getLocationStatusFromLoad(payload.currentLoad, payload.capacity),
       is_active: true,
     },
   );
 
-  const quantity = Math.max(0, payload.currentLoad);
-  const existingInventory = inventoriesAtLocation.find((item) => String(item.product_id) === payload.productId);
-  if (existingInventory) {
-    await apiClient.patch(`/api/inventories/${existingInventory.id}`, {
-      quantity,
-      reserved_quantity: 0,
-      available_quantity: quantity,
-    });
-  } else {
-    await apiClient.post('/api/inventories', {
-      product_id: Number(payload.productId),
-      warehouse_location_id: Number(locationId),
-      quantity,
-      reserved_quantity: 0,
-      available_quantity: quantity,
-    });
-  }
+  // Persist selected category scope on this location so re-open/re-select hydrates correct form values.
+  await syncLocationCategoryScope([locationId], [payload.categoryId]);
+
+  setBinAssignmentFallback(locationId, {
+    categoryId: payload.categoryId,
+    productId: payload.productId,
+    productName: selectedProduct.name,
+    // Lưu currentLoad vào localStorage để module xuất kho đọc tồn kho khả dụng
+    // mà không phụ thuộc hoàn toàn vào API /api/inventories (có thể chưa đồng bộ)
+    currentLoad: payload.currentLoad,
+  });
 
   const location = mapLocation(unwrapApiData<WarehouseLocationApiItem>(response));
 
@@ -1471,4 +1661,31 @@ export async function getWarehouseProductOptions(categoryId?: string): Promise<W
     name: product.name,
     categoryIds: product.categories.map((category) => String(category.id)),
   }));
+}
+
+export async function getBinInventories(locationId: string): Promise<import('../features/warehouses/types/warehouseType').BinInventoryItem[]> {
+  const numericId = Number(locationId);
+  if (!locationId || Number.isNaN(numericId)) return [];
+
+  try {
+    const response = await apiClient.get<ApiResponse<InventoryListApiData>>('/api/inventories', {
+      params: { warehouse_location_id: numericId, page: 1, limit: 100 },
+    });
+    const payload = unwrapApiData<InventoryListApiData>(response);
+    const rows = payload.items ?? payload.inventories ?? [];
+
+    return rows.map((row) => ({
+      id: row.id,
+      product_id: row.product_id,
+      product_code: row.product?.code ?? String(row.product_id),
+      product_name: row.product?.name ?? '',
+      lot_id: row.lot_id ?? null,
+      lot_code: row.lot?.lot_no ?? null,
+      available_quantity: Number(row.available_quantity ?? 0),
+      uom_name: row.uom?.uom?.name ?? row.uom?.name ?? '',
+      product_uom_id: row.product_uom_id ?? 0,
+    }));
+  } catch {
+    return [];
+  }
 }

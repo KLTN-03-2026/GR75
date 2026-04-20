@@ -21,15 +21,19 @@ import { ZoneDetailPage } from './pages/admin/ZoneDetailPage';
 import { ImportExportPage } from './pages/operations/ImportExportPage';
 import { InventoryPage } from './pages/operations/InventoryPage';
 import { AiForecastPage } from './pages/operations/AiForecastPage';
+import { AiForecastDetailPage } from './pages/operations/AiForecastDetailPage';
 import { InboundManagementPage } from './pages/operations/InboundManagementPage';
 import { InboundDetailPage } from './pages/operations/InboundDetailPage';
 import { TransactionHistoryPage } from './pages/operations/TransactionHistoryPage';
 
 import { OutboundListPage } from './pages/operations/OutboundListPage';
 import { OutboundDetailPage } from './pages/operations/OutboundDetailPage';
-import { OutboundCreatePage } from './pages/operations/OutboundCreatePage';
 import { OutboundPickingPage } from './pages/operations/OutboundPickingPage';
 import { Toaster } from './components/ui/toaster';
+import { AntdDashboard } from './pages/AntdDashboard';
+import { DashboardPage } from './pages/operations/DashboardPage';
+import { ReportsPage } from './pages/operations/ReportsPage';
+import { SalesDataPage } from './pages/operations/SalesDataPage';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -60,10 +64,14 @@ function DefaultLandingRoute() {
   const role = user?.role;
 
   const candidates = [
+    '/admin/warehouses',
     '/admin/product-settings',
     '/admin/categories',
     '/admin/products',
-    '/admin/warehouses',
+    '/inbound',
+    '/outbound',
+    '/inventory',
+    '/inventory/transactions',
     '/admin/users',
     '/admin/role-permissions',
     '/admin/approval-configuration',
@@ -72,6 +80,11 @@ function DefaultLandingRoute() {
   const firstAccessible = candidates.find((path) =>
     hasPageAccessFromPermissionNames(path, permissions, role),
   );
+
+  const canAccessRoot = hasPageAccessFromPermissionNames('/', permissions, role);
+  if (canAccessRoot) {
+    return <DashboardPage />;
+  }
 
   return <Navigate to={firstAccessible ?? '/profile'} replace />;
 }
@@ -120,16 +133,21 @@ function App() {
             <Route path="/inventory" element={<PageAccessRoute path="/inventory"><InventoryPage /></PageAccessRoute>} />
             <Route path="/inventory/transactions" element={<PageAccessRoute path="/inventory/transactions"><TransactionHistoryPage /></PageAccessRoute>} />
             <Route path="/ai-forecast" element={<PageAccessRoute path="/ai-forecast"><AiForecastPage /></PageAccessRoute>} />
+            <Route path="/ai-forecast/:sku" element={<PageAccessRoute path="/ai-forecast"><AiForecastDetailPage /></PageAccessRoute>} />
+            <Route path="/sales-data" element={<PageAccessRoute path="/sales-data"><SalesDataPage /></PageAccessRoute>} />
+            <Route path="/reports" element={<PageAccessRoute path="/reports"><ReportsPage /></PageAccessRoute>} />
             <Route path="/inbound" element={<PageAccessRoute path="/inbound"><InboundManagementPage /></PageAccessRoute>} />
             <Route path="/inbound/:id" element={<PageAccessRoute path="/inbound"><InboundDetailPage /></PageAccessRoute>} />
             <Route path="/outbound" element={<PageAccessRoute path="/outbound"><OutboundListPage /></PageAccessRoute>} />
-            <Route path="/outbound/create" element={<PageAccessRoute path="/outbound"><OutboundCreatePage /></PageAccessRoute>} />
             <Route path="/outbound/:id" element={<PageAccessRoute path="/outbound"><OutboundDetailPage /></PageAccessRoute>} />
             <Route path="/outbound/:id/picking" element={<PageAccessRoute path="/outbound"><OutboundPickingPage /></PageAccessRoute>} />
           </Route>
 
           {/* 404 — mọi route không khớp */}
           <Route path="*" element={<NotFoundPage />} />
+
+          {/* Ant Design Prototype */}
+          <Route path="/antd" element={<AntdDashboard />} />
         </Routes>
         <Toaster />
       </BrowserRouter>
