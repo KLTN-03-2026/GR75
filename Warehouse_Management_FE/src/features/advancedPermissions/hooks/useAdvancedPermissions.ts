@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   getAdvancedRolePermissions,
   updateAdvancedRolePermissions,
-} from '@/services/advancedPermissionService';
+} from '@/services/advancedPagePermissionService';
 import { getRoles } from '@/services/roleService';
 import type { UpdateAdvancedPermissionPayload } from '../types/advancedPermissionType';
 
@@ -36,6 +36,7 @@ export function useUpdateAdvancedPermissions() {
     onSuccess: (data, { roleId }) => {
       queryClient.setQueryData(ADVANCED_PERM_KEYS.byRole(roleId), data);
       queryClient.invalidateQueries({ queryKey: ADVANCED_PERM_KEYS.byRole(roleId) });
+      queryClient.invalidateQueries({ queryKey: ['roles', 'permissions', roleId] });
     },
   });
 }

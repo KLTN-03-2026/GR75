@@ -49,6 +49,16 @@ const MODEL_TO_MODULE: Record<string, string> = {
   StockOut: 'STOCK_OUT',
   StockOutDetail: 'STOCK_OUT',
   StockOutDetailLot: 'STOCK_OUT',
+  StockCount: 'STOCK_COUNT',
+  StockCountDetail: 'STOCK_COUNT',
+  StockCountAdjustment: 'STOCK_COUNT',
+  DisposalReason: 'STOCK_DISPOSAL',
+  StockDisposal: 'STOCK_DISPOSAL',
+  StockDisposalDetail: 'STOCK_DISPOSAL',
+  StockDisposalHistory: 'STOCK_DISPOSAL',
+  SalesImportBatch: 'SALES_MANAGEMENT',
+  SalesTransaction: 'SALES_MANAGEMENT',
+  SalesDailySummary: 'SALES_MANAGEMENT',
 };
 
 /** Chuyển PascalCase sang camelCase để truy cập dynamic model trên Prisma */
